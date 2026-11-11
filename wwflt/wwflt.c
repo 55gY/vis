@@ -766,8 +766,10 @@ static FLT_PREOP_CALLBACK_STATUS WwPreWrite(PFLT_CALLBACK_DATA Data, PCFLT_RELAT
             return FLT_PREOP_COMPLETE;
         }
         MmBuildMdlForNonPagedPool(wctx->swap_mdl);
+        /* Swap the MDL via the parameter block only. FLT_IO_PARAMETER_BLOCK
+         * has no Irp member; the filter manager derives the IRP's MDL from
+         * Parameters.Write.MdlAddress when the IRP goes down. */
         Data->Iopb->Parameters.Write.MdlAddress = wctx->swap_mdl;
-        Data->Iopb->Irp->MdlAddress = wctx->swap_mdl;
     } else {
         wctx->orig_buffer = Data->Iopb->Parameters.Write.WriteBuffer;
         Data->Iopb->Parameters.Write.WriteBuffer = wctx->swap_buffer;
@@ -789,7 +791,6 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostWrite(PFLT_CALLBACK_DATA Data, PCFLT_REL
     if (!wctx) return FLT_POSTOP_FINISHED_PROCESSING;
     if (wctx->swap_mdl) {
         Data->Iopb->Parameters.Write.MdlAddress = wctx->orig_mdl;
-        Data->Iopb->Irp->MdlAddress = wctx->orig_mdl;
         IoFreeMdl(wctx->swap_mdl);
     } else if (wctx->orig_buffer) {
         Data->Iopb->Parameters.Write.WriteBuffer = wctx->orig_buffer;
@@ -1010,7 +1011,7 @@ static NTSTATUS WwInstanceSetup(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_S
     /* Attach to fixed disk volumes with a recognizable filesystem.
      * Skip network / removable / RAW volumes in Phase 1. */
     if (VolumeDeviceType != FILE_DEVICE_DISK_FILE_SYSTEM) return STATUS_FLT_DO_NOT_ATTACH;
-    if (VolumeFilesystemType != FLT_FS_NTFS && VolumeFilesystemType != FLT_FS_FAT) return STATUS_FLT_DO_NOT_ATTACH;
+    if (VolumeFilesystemType != FLT_FSTYPE_NTFS && VolumeFilesystemType != FLT_FSTYPE_FAT) return STATUS_FLT_DO_NOT_ATTACH;
     return STATUS_SUCCESS;
 }
 
