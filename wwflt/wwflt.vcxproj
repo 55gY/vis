@@ -58,6 +58,17 @@
       <AdditionalLibraryDirectories>$(WdkRoot)Lib\$(WdkVersion)\km\$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
+  <!-- Debug: turn off Basic Runtime Checks (/RTC1). The kernel-driver
+       toolset enables RTC for Debug by default, which emits calls to
+       _RTC_InitBase / _RTC_Shutdown / _RTC_CheckStackVars. Those live in
+       the CRT, which a /NODEFAULTLIB driver never links, so the Debug
+       link fails with LNK2001/LNK2019. RTC is meaningless for a kernel
+       driver anyway. -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="wwflt.h" />
     <ClInclude Include="sbox.h" />
