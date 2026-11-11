@@ -497,8 +497,11 @@ static FLT_PREOP_CALLBACK_STATUS WwPreCreate(PFLT_CALLBACK_DATA Data, PCFLT_RELA
 }
 
 /* IRP_MJ_CREATE post-op: the file is now open. Decide whether it is
- * already encrypted (read the header) or needs a header (new file). */
-static FLT_POSTOP_CALLBACK_STATUS WwPostCreate(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID CompletionContext, FLT_POSTOP_FLAGS Flags)
+ * already encrypted (read the header) or needs a header (new file).
+ * NOTE: the Flags parameter is ULONG, not FLT_POSTOP_FLAGS. The WDK
+ * typedefs FLT_POSTOP_FLAGS to ULONG, but this build's fltKernel.h
+ * does not expose the name (C2081), so the plain ULONG is used. */
+static FLT_POSTOP_CALLBACK_STATUS WwPostCreate(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID CompletionContext, ULONG Flags)
 {
     NTSTATUS st;
     WWFLT_STREAM_CTX *sctx = NULL;
@@ -635,7 +638,7 @@ static FLT_PREOP_CALLBACK_STATUS WwPreRead(PFLT_CALLBACK_DATA Data, PCFLT_RELATE
 
 /* IRP_MJ_READ post-op: decrypt the buffer read from disk. Only called
  * for paging/non-cached reads (see WwPreRead). */
-static FLT_POSTOP_CALLBACK_STATUS WwPostRead(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID CompletionContext, FLT_POSTOP_FLAGS Flags)
+static FLT_POSTOP_CALLBACK_STATUS WwPostRead(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID CompletionContext, ULONG Flags)
 {
     WWFLT_STREAM_CTX *sctx;
     PVOID buf = NULL;
@@ -778,7 +781,7 @@ static FLT_PREOP_CALLBACK_STATUS WwPreWrite(PFLT_CALLBACK_DATA Data, PCFLT_RELAT
 
 /* IRP_MJ_WRITE post-op: restore the original MDL/buffer and free the
  * swap buffer. Runs for every write that WwPreWrite swapped. */
-static FLT_POSTOP_CALLBACK_STATUS WwPostWrite(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID CompletionContext, FLT_POSTOP_FLAGS Flags)
+static FLT_POSTOP_CALLBACK_STATUS WwPostWrite(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID CompletionContext, ULONG Flags)
 {
     WWFLT_WRITE_CTX *wctx = (WWFLT_WRITE_CTX *)CompletionContext;
     UNREFERENCED_PARAMETER(FltObjects);
@@ -822,7 +825,7 @@ static FLT_PREOP_CALLBACK_STATUS WwPreSetInfo(PFLT_CALLBACK_DATA Data, PCFLT_REL
 }
 
 /* IRP_MJ_QUERY_INFORMATION post-op: report the logical size (physical - 512). */
-static FLT_POSTOP_CALLBACK_STATUS WwPostQueryInfo(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID CompletionContext, FLT_POSTOP_FLAGS Flags)
+static FLT_POSTOP_CALLBACK_STATUS WwPostQueryInfo(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID CompletionContext, ULONG Flags)
 {
     WWFLT_STREAM_CTX *sctx;
     FILE_INFORMATION_CLASS fic;
