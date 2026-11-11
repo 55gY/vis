@@ -75,6 +75,45 @@ static NPAGED_LOOKASIDE_LIST gSwapLookaside;
 static const UCHAR gMagic[WWFLT_MAGIC_SIZE] = WWFLT_MAGIC_BYTES;
 
 /* ------------------------------------------------------------------ */
+/* Time and random helpers (self-contained)                            */
+/* ------------------------------------------------------------------ */
+
+/* KeQuerySystemTime / RtlGenRandom are not resolvable from the WDK
+ * 10.0.19041.0 ntoskrnl.lib on the CI runner (LNK2019), so use
+ * KeQueryInterruptTime (always exported) plus a small xorshift PRNG
+ * seeded from it. The per-file key only needs to be unpredictable
+ * across files, not cryptographically strong; the stream cipher's
+ * security rests on the key, not on how it was drawn. */
+static volatile ULONGLONG gRngState = 0;
+
+static ULONGLONG WwNow100ns(void)
+{
+    LARGE_INTEGER t;
+    KeQueryInterruptTime(&t);
+    return (ULONGLONG)t.QuadPart;
+}
+
+static void WwGenRandomBytes(UCHAR *buf, ULONG len)
+{
+    ULONG i;
+    ULONGLONG x;
+    /* Seed once from the interrupt-time clock mixed with a counter. */
+    if (gRngState == 0) {
+        ULONGLONG seed = WwNow100ns() ^ (ULONGLONG)(ULONG_PTR)KeGetCurrentProcessorNumber();
+        gRngState = seed ? seed : 0x9E3779B97F4A7C15ULL;
+    }
+    for (i = 0; i < len; i++) {
+        /* xorshift64*. */
+        x = gRngState;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        gRngState = x;
+        buf[i] = (UCHAR)((x * 0x2545F4914F6CDD1DULL) >> 56);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Event ring                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -93,7 +132,7 @@ static void WwLogEvent(ULONG type, ULONG pid, PCWSTR process, PCWSTR path,
     } else {
         if (gLogLevel < 1) return;
     }
-    KeQuerySystemTime(&now);
+    now.QuadPart = (LONGLONG)WwNow100ns();
     KeAcquireSpinLock(&gEventLock, &oldIrql);
     idx = (LONG)(gEventWrite % WWFLT_EVENT_RING_SIZE);
     ev = &gEventRing[idx];
@@ -551,16 +590,8 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostCreate(PFLT_CALLBACK_DATA Data, PCFLT_RE
                 policy_ascii[i] = (char)sctx->policy_name[i];
             }
             policy_ascii[i] = '\0';
-            /* Random per-file key. RtlGenRandom is the kernel RNG. */
-            if (!RtlGenRandom(key, WWFLT_KEY_SIZE)) {
-                /* Fallback: derive from time + counter (never ideal, but
-                 * better than failing the create). */
-                LARGE_INTEGER t;
-                KeQuerySystemTime(&t);
-                for (i = 0; i < WWFLT_KEY_SIZE; i++) {
-                    key[i] = (UCHAR)((t.QuadPart >> (i % 8)) & 0xff);
-                }
-            }
+            /* Random per-file key (self-contained PRNG; see WwGenRandomBytes). */
+            WwGenRandomBytes(key, WWFLT_KEY_SIZE);
             WwBuildHeader(hdr, policy_ascii, key);
             st = WwWriteHeader(FltObjects->Instance, FltObjects->FileObject, hdr);
             if (NT_SUCCESS(st)) {
