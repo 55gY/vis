@@ -70,7 +70,9 @@ jobs:
           # run the Link target on this runner (no .sys is produced), so
           # link the .obj files into wwflt.sys explicitly.
           $vsPath = & "C:\ProgramData\Chocolatey\bin\vswhere.exe" -products * -requires Microsoft.Component.MSBuild -property installationPath -latest -version "[17.0,18.0)"
-          $linkExe = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Recurse -Filter "link.exe" | Where-Object { $_.FullName -match "HostX64\\x64" } | Select-Object -First 1 -ExpandProperty FullName
+          # Pick the NEWEST link.exe (the runner has several MSVC versions;
+          # an older linker mismatches the compiler and mis-resolves libs).
+          $linkExe = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Recurse -Filter "link.exe" | Where-Object { $_.FullName -match "HostX64\\x64" } | Sort-Object { [version]($_.Directory.Parent.Parent.Name) } -Descending | Select-Object -First 1 -ExpandProperty FullName
           if (-not $linkExe) { throw "link.exe not found" }
           $cfg = "${{ matrix.configuration }}"
           $outDir = "wwflt\x64\$cfg"
@@ -78,7 +80,10 @@ jobs:
           $objs = Get-ChildItem -Path $outDir -Filter "*.obj" | ForEach-Object { $_.FullName }
           if ($objs.Count -eq 0) { throw "no .obj files in $outDir" }
           Write-Host "Linking $($objs.Count) objects with $linkExe"
-          & $linkExe /NOLOGO /OUT:"$outDir\wwflt.sys" /SUBSYSTEM:NATIVE /DRIVER:WDM /ENTRY:DriverEntry /NODEFAULTLIB /MACHINE:X64 /DEBUG /PDB:"$outDir\wwflt.pdb" /OPT:REF /OPT:ICF $objs "$wdkLib\fltMgr.lib" "$wdkLib\ntoskrnl.lib"
+          # BufferOverflowK.lib provides __security_cookie / __security_check_cookie /
+          # __report_rangecheckfailure (the /GS buffer-security checks the compiler
+          # emitted). fltMgr.lib + ntoskrnl.lib cover the filter-manager and kernel APIs.
+          & $linkExe /NOLOGO /OUT:"$outDir\wwflt.sys" /SUBSYSTEM:NATIVE /DRIVER:WDM /ENTRY:DriverEntry /NODEFAULTLIB /MACHINE:X64 /DEBUG /PDB:"$outDir\wwflt.pdb" /OPT:REF /OPT:ICF $objs "$wdkLib\fltMgr.lib" "$wdkLib\ntoskrnl.lib" "$wdkLib\BufferOverflowK.lib"
           if ($LASTEXITCODE -ne 0) { throw "link failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path "$outDir\wwflt.sys")) { throw "wwflt.sys was not created" }
           Write-Host "wwflt.sys OK: $((Get-Item "$outDir\wwflt.sys").Length) bytes"
