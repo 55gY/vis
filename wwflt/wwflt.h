@@ -58,7 +58,7 @@ typedef struct _WWFLT_POLICY {
     WCHAR group[WWFLT_MAX_GROUP_LEN];      /* e.g. L"主加密策略" */
     ULONG proc_count;
     WWFLT_PROC_RULE procs[WWFLT_MAX_PROCESSES];
-} WWFLT_POLICY;
+} WWFLT_POLICY, *PWWFLT_POLICY;
 
 /* ---- driver status (IOCTL_WWFLT_GET_STATUS) ---- */
 typedef struct _WWFLT_STATUS {
@@ -70,7 +70,7 @@ typedef struct _WWFLT_STATUS {
     ULONGLONG policy_lookups;              /* create-time policy evaluations */
     ULONGLONG io_filtered;                 /* total read/write callbacks seen */
     ULONGLONG errors;                      /* failed operations counted */
-} WWFLT_STATUS;
+} WWFLT_STATUS, *PWWFLT_STATUS;
 
 /* ---- event log (IOCTL_WWFLT_GET_EVENTS) ----
  * The driver keeps a fixed-size ring (no unbounded growth). Each event is
@@ -95,7 +95,7 @@ typedef struct _WWFLT_EVENT {
     ULONGLONG offset;                      /* logical file offset */
     ULONG length;                          /* bytes */
     LONG status;                           /* NTSTATUS of the operation */
-} WWFLT_EVENT;
+} WWFLT_EVENT, *PWWFLT_EVENT;
 
 /* ---- IOCTL codes ---- */
 #define WWFLT_IOCTL_BASE       0x800
@@ -110,11 +110,11 @@ typedef struct _WWFLT_EVENT {
 typedef struct _WWFLT_EVENT_COUNT {
     ULONG count;                           /* events returned */
     ULONG dropped;                         /* events overwritten before being read */
-} WWFLT_EVENT_COUNT;
+} WWFLT_EVENT_COUNT, *PWWFLT_EVENT_COUNT;
 
 /* SET_LOG_LEVEL input: a single ULONG (0=errors only, 1=crypto events,
  * 2=policy evaluations). SET_CONFIG input: WWFLT_CONFIG. */
 typedef struct _WWFLT_CONFIG {
     ULONG enabled;                         /* 0 = driver passes everything through */
     ULONG reserved[7];
-} WWFLT_CONFIG;
+} WWFLT_CONFIG, *PWWFLT_CONFIG;
