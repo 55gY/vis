@@ -38,15 +38,24 @@
     <TargetName>wwflt</TargetName>
     <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(Platform)\$(Configuration)\</IntDir>
+    <!-- Explicit WDK paths. The WindowsKernelModeDriver10.0 toolset is
+         supposed to add these itself, but on a fresh CI runner it does not
+         resolve them (MSBuild emits no /I flags at all), so the build fails
+         with C1083 on fltKernel.h. These paths match the WDK version the
+         CI workflow installs (Chocolatey windowsdriverkit10 = 10.0.19041). -->
+    <WdkRoot>C:\Program Files (x86)\Windows Kits\10\</WdkRoot>
+    <WdkVersion>10.0.19041.0</WdkVersion>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <PreprocessorDefinitions>_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level3</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
+      <AdditionalIncludeDirectories>$(WdkRoot)Include\$(WdkVersion)\km;$(WdkRoot)Include\$(WdkVersion)\km\crt;$(WdkRoot)Include\$(WdkVersion)\shared;$(WdkRoot)Include\$(WdkVersion)\um;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <AdditionalDependencies>fltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(WdkRoot)Lib\$(WdkVersion)\km\$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
