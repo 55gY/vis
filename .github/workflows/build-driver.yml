@@ -1,6 +1,7 @@
 # Build the WWFilter minifilter driver (Windows, WDK) on GitHub Actions.
-# The windows-2022 runner comes with Visual Studio 2022 and the Windows
-# Driver Kit (WDK) pre-installed, so no WDK install step is needed.
+# The windows-2022 runner comes with Visual Studio 2022 pre-installed, but
+# NOT the Windows Driver Kit (WDK). The workflow installs the WDK via
+# Chocolatey first (this is what provides fltKernel.h / fltMgr.lib).
 # Output: wwflt.sys (Release, x64), uploaded as an artifact.
 name: Build WWFilter driver
 
@@ -31,7 +32,7 @@ jobs:
   build:
     name: build-${{ matrix.configuration }}
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +40,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install WDK
+        shell: pwsh
+        run: |
+          choco install windowsdriverkit10 -y --no-progress
+          $flt = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Include" -Recurse -Filter "fltKernel.h" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $flt) { throw "WDK install did not provide fltKernel.h" }
+          Write-Host "WDK OK: $($flt.FullName)"
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
