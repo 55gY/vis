@@ -63,6 +63,26 @@ jobs:
             /p:Platform=${{ env.PLATFORM }} `
             /p:PreferredToolArchitecture=x64
 
+      - name: Link driver
+        shell: pwsh
+        run: |
+          # The WindowsKernelModeDriver10.0 toolset compiles but does not
+          # run the Link target on this runner (no .sys is produced), so
+          # link the .obj files into wwflt.sys explicitly.
+          $vsPath = & "C:\ProgramData\Chocolatey\bin\vswhere.exe" -products * -requires Microsoft.Component.MSBuild -property installationPath -latest -version "[17.0,18.0)"
+          $linkExe = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Recurse -Filter "link.exe" | Where-Object { $_.FullName -match "HostX64\\x64" } | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $linkExe) { throw "link.exe not found" }
+          $cfg = "${{ matrix.configuration }}"
+          $outDir = "wwflt\x64\$cfg"
+          $wdkLib = "C:\Program Files (x86)\Windows Kits\10\Lib\10.0.19041.0\km\x64"
+          $objs = Get-ChildItem -Path $outDir -Filter "*.obj" | ForEach-Object { $_.FullName }
+          if ($objs.Count -eq 0) { throw "no .obj files in $outDir" }
+          Write-Host "Linking $($objs.Count) objects with $linkExe"
+          & $linkExe /NOLOGO /OUT:"$outDir\wwflt.sys" /SUBSYSTEM:NATIVE /DRIVER:WDM /ENTRY:DriverEntry /NODEFAULTLIB /MACHINE:X64 /DEBUG /PDB:"$outDir\wwflt.pdb" /OPT:REF /OPT:ICF $objs "$wdkLib\fltMgr.lib" "$wdkLib\ntoskrnl.lib"
+          if ($LASTEXITCODE -ne 0) { throw "link failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path "$outDir\wwflt.sys")) { throw "wwflt.sys was not created" }
+          Write-Host "wwflt.sys OK: $((Get-Item "$outDir\wwflt.sys").Length) bytes"
+
       - name: Upload driver artifact
         uses: actions/upload-artifact@v4
         with:
