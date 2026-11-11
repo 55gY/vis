@@ -72,7 +72,9 @@ jobs:
           $vsPath = & "C:\ProgramData\Chocolatey\bin\vswhere.exe" -products * -requires Microsoft.Component.MSBuild -property installationPath -latest -version "[17.0,18.0)"
           # Pick the NEWEST link.exe (the runner has several MSVC versions;
           # an older linker mismatches the compiler and mis-resolves libs).
-          $linkExe = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Recurse -Filter "link.exe" | Where-Object { $_.FullName -match "HostX64\\x64" } | Sort-Object { [version]($_.Directory.Parent.Parent.Name) } -Descending | Select-Object -First 1 -ExpandProperty FullName
+          # Path is ...\MSVC\<version>\bin\HostX64\x64\link.exe, so the
+          # version is three parents up from link.exe's directory.
+          $linkExe = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Recurse -Filter "link.exe" | Where-Object { $_.FullName -match "HostX64\\x64" } | Sort-Object { [version]($_.Directory.Parent.Parent.Parent.Name) } -Descending | Select-Object -First 1 -ExpandProperty FullName
           if (-not $linkExe) { throw "link.exe not found" }
           $cfg = "${{ matrix.configuration }}"
           $outDir = "wwflt\x64\$cfg"
