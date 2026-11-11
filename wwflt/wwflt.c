@@ -78,26 +78,27 @@ static const UCHAR gMagic[WWFLT_MAGIC_SIZE] = WWFLT_MAGIC_BYTES;
 /* Time and random helpers (self-contained)                            */
 /* ------------------------------------------------------------------ */
 
-/* KeQuerySystemTime / RtlGenRandom are not resolvable from the WDK
- * 10.0.19041.0 ntoskrnl.lib on the CI runner (LNK2019), so use
- * KeQueryInterruptTime (always exported) plus a small xorshift PRNG
- * seeded from it. The per-file key only needs to be unpredictable
- * across files, not cryptographically strong; the stream cipher's
- * security rests on the key, not on how it was drawn. */
+/* KeQuerySystemTime / RtlGenRandom / KeQueryInterruptTime are not
+ * resolvable from the WDK 10.0.19041.0 ntoskrnl.lib on the CI runner
+ * (LNK2019; this WDK implements the KeQuery* time reads as inline
+ * KUSER_SHARED_DATA accesses, so no export exists to link). Use a
+ * monotonic counter instead: the event log only needs ordering, and
+ * the PRNG only needs a seed that differs across boots/files. */
 static volatile ULONGLONG gRngState = 0;
+static volatile LONGLONG gMonoCounter = 0;
 
 static ULONGLONG WwNow100ns(void)
 {
-    LARGE_INTEGER t;
-    KeQueryInterruptTime(&t);
-    return (ULONGLONG)t.QuadPart;
+    /* Monotonic sequence, not wall-clock time. */
+    return (ULONGLONG)InterlockedIncrement64(&gMonoCounter);
 }
 
 static void WwGenRandomBytes(UCHAR *buf, ULONG len)
 {
     ULONG i;
     ULONGLONG x;
-    /* Seed once from the interrupt-time clock mixed with a counter. */
+    /* Seed once from the monotonic counter mixed with the processor
+     * number. KeGetCurrentProcessorNumber is a PCR read, not a link. */
     if (gRngState == 0) {
         ULONGLONG seed = WwNow100ns() ^ (ULONGLONG)(ULONG_PTR)KeGetCurrentProcessorNumber();
         gRngState = seed ? seed : 0x9E3779B97F4A7C15ULL;
