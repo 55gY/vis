@@ -99,3 +99,4 @@ jobs:
           path: |
             wwflt/x64/${{ matrix.configuration }}/wwflt.sys
             wwflt/x64/${{ matrix.configuration }}/wwflt.pdb
+            wwflt/wwflt.inf

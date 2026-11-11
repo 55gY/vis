@@ -1,0 +1,66 @@
+; wwflt.inf -- WWFilter minifilter driver install file.
+;
+; Install (testsigning on, or a properly signed build):
+;   Right-click -> Install, or:
+;     rundll32.exe setupapi,InstallHinfSection DefaultInstall 132 .\wwflt.inf
+;   Then load:
+;     fltmc load wwflt
+;   Unload / uninstall:
+;     fltmc unload wwflt
+;     rundll32.exe setupapi,InstallHinfSection DefaultUninstall 132 .\wwflt.inf
+;
+; Altitude 141000 sits in the FSFilter Encryption range (140000-149999).
+; It is a development value; a production altitude must be allocated by
+; Microsoft (https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/allocating-altitudes).
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/11/2026,1.0.0.0
+CatalogFile = wwflt.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[DefaultInstall]
+OptionDesc = %ServiceDesc%
+CopyFiles  = @wwflt.sys
+
+[DefaultInstall.Services]
+AddService = WWFilter, , WWFilter.Service
+
+[DefaultUninstall]
+DelFiles   = @wwflt.sys
+
+[DefaultUninstall.Services]
+DelService = WWFilter, 0x200
+
+[WWFilter.Service]
+DisplayName    = %ServiceDesc%
+Description    = %ServiceDesc%
+ServiceType    = 2    ; FILE_SYSTEM_DRIVER
+StartType      = 3    ; SERVICE_DEMAND_START (fltmc load)
+ErrorControl   = 1    ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\wwflt.sys
+LoadOrderGroup = "FSFilter Encryption"
+Dependencies   = FltMgr
+AddReg         = WWFilter.AddReg
+
+[WWFilter.AddReg]
+HKR, "Instances", "DefaultInstance", 0x00000000, %InstanceName%
+HKR, "Instances\%InstanceName%", "Altitude", 0x00000000, "141000"
+HKR, "Instances\%InstanceName%", "Flags", 0x00010001, 0x0
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+wwflt.sys = 1,,
+
+[Strings]
+Provider     = "WWFilter"
+ServiceDesc  = "WWFilter transparent file encryption filter"
+InstanceName = "WWFilter Instance"
+DiskName     = "WWFilter install media"
