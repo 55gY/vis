@@ -1,0 +1,65 @@
+# Build the WWFilter minifilter driver (Windows, WDK) on GitHub Actions.
+# The windows-2022 runner comes with Visual Studio 2022 and the Windows
+# Driver Kit (WDK) pre-installed, so no WDK install step is needed.
+# Output: wwflt.sys (Release, x64), uploaded as an artifact.
+name: Build WWFilter driver
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "wwflt/**"
+      - ".github/workflows/build-driver.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "wwflt/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOLUTION_FILE_PATH: ./wwflt/wwflt.sln
+  PLATFORM: x64
+
+jobs:
+  build:
+    name: build-${{ matrix.configuration }}
+    runs-on: windows-2022
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Release, Debug]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+          vs-version: "[17.0,18.0)"
+
+      - name: Build solution
+        run: |
+          msbuild ${{ env.SOLUTION_FILE_PATH }} /m /t:Rebuild `
+            /nodeReuse:false `
+            /p:Configuration=${{ matrix.configuration }} `
+            /p:Platform=${{ env.PLATFORM }} `
+            /p:PreferredToolArchitecture=x64
+
+      - name: Upload driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wwflt-${{ matrix.configuration }}-x64
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            wwflt/x64/${{ matrix.configuration }}/wwflt.sys
+            wwflt/x64/${{ matrix.configuration }}/wwflt.pdb
