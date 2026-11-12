@@ -122,6 +122,9 @@ jobs:
           mkdir -p /tmp/zig
           tar -xf /tmp/zig.tar.xz -C /tmp/zig --strip-components=1
           echo "/tmp/zig" >> $GITHUB_PATH
+          # NOTE: $GITHUB_PATH only affects LATER steps, not this shell,
+          # so export PATH here too before calling zig.
+          export PATH="/tmp/zig:$PATH"
           zig version
 
       - name: Build wwsvc.exe
