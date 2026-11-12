@@ -505,6 +505,18 @@ static FLT_PREOP_CALLBACK_STATUS WwPreCreate(PFLT_CALLBACK_DATA Data, PCFLT_RELA
     st = FltParseFileNameInformation(name_info);
     if (!NT_SUCCESS(st)) { FltReleaseFileNameInformation(name_info); return FLT_PREOP_SUCCESS_NO_CALLBACK; }
     if (WwGetRequestorExe(Data, exe, WWFLT_MAX_EXE_LEN) != STATUS_SUCCESS) {
+        /* Diagnostic: log .txt opens where the requestor exe could not
+         * be resolved (SeLocateProcessImageName failed). Without the exe
+         * name the policy cannot be evaluated, so the open is invisible
+         * to the .txt diagnostic below. proc is left empty here. */
+        if (gLogLevel >= 2) {
+            WCHAR ext_dbg[WWFLT_MAX_EXT_LEN];
+            if (WwGetExtension(name_info->FinalComponent.Buffer, ext_dbg, WWFLT_MAX_EXT_LEN) &&
+                WwWcsIcmp(ext_dbg, L"txt") == 0) {
+                WwLogEvent(WWFLT_EVENT_POLICY, HandleToUlong(PsGetCurrentProcessId()),
+                           NULL, name_info->Name.Buffer, 0, 0, (NTSTATUS)0xC0000001);
+            }
+        }
         FltReleaseFileNameInformation(name_info);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
