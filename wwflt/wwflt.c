@@ -501,7 +501,33 @@ static FLT_PREOP_CALLBACK_STATUS WwPreCreate(PFLT_CALLBACK_DATA Data, PCFLT_RELA
         /* Opening by file ID / no stream yet; let it through. */
     }
     st = FltGetFileNameInformation(Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &name_info);
-    if (!NT_SUCCESS(st)) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!NT_SUCCESS(st)) {
+        /* Diagnostic: log .txt opens where the normalized name could
+         * not be retrieved. Use the FileObject's raw name
+         * (length-bounded, copied to a null-terminated temp buffer)
+         * to decide if it's a .txt file. A Notepad open that fails
+         * here is otherwise completely invisible. */
+        if (gLogLevel >= 2 && FltObjects->FileObject && FltObjects->FileObject->FileName.Buffer) {
+            UNICODE_STRING *raw = &FltObjects->FileObject->FileName;
+            ULONG nch = raw->Length / sizeof(WCHAR);
+            if (nch >= 4) {
+                WCHAR *tail = raw->Buffer + nch - 4;
+                if (tail[0] == L'.' &&
+                    (tail[1] == L't' || tail[1] == L'T') &&
+                    (tail[2] == L'x' || tail[2] == L'X') &&
+                    (tail[3] == L't' || tail[3] == L'T')) {
+                    WCHAR tmp[WWFLT_MAX_EVENT_PATH];
+                    ULONG copy = nch < (WWFLT_MAX_EVENT_PATH - 1) ? nch : (WWFLT_MAX_EVENT_PATH - 1);
+                    ULONG i;
+                    for (i = 0; i < copy; i++) tmp[i] = raw->Buffer[i];
+                    tmp[copy] = L'\0';
+                    WwLogEvent(WWFLT_EVENT_POLICY, HandleToUlong(PsGetCurrentProcessId()),
+                               NULL, tmp, 0, 0, st);
+                }
+            }
+        }
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
     st = FltParseFileNameInformation(name_info);
     if (!NT_SUCCESS(st)) { FltReleaseFileNameInformation(name_info); return FLT_PREOP_SUCCESS_NO_CALLBACK; }
     if (WwGetRequestorExe(Data, exe, WWFLT_MAX_EXE_LEN) != STATUS_SUCCESS) {
