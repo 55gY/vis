@@ -1,20 +1,23 @@
-# Build the WWFilter minifilter driver (Windows, WDK) on GitHub Actions.
+# Build the WWFilter minifilter driver (Windows, WDK) and the wwsvc service
+# (Linux, Zig cross-compile) on GitHub Actions.
 # The windows-2022 runner comes with Visual Studio 2022 pre-installed, but
 # NOT the Windows Driver Kit (WDK). The workflow installs the WDK via
 # Chocolatey first (this is what provides fltKernel.h / fltMgr.lib).
-# Output: wwflt.sys (Release, x64), uploaded as an artifact.
-name: Build WWFilter driver
+# Output: wwflt.sys (Release/Debug, x64) + wwsvc.exe (x64), uploaded as artifacts.
+name: Build WWFilter driver and service
 
 on:
   push:
     branches: ["main"]
     paths:
       - "wwflt/**"
+      - "wwsvc/**"
       - ".github/workflows/build-driver.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "wwflt/**"
+      - "wwsvc/**"
   workflow_dispatch:
 
 permissions:
@@ -100,3 +103,33 @@ jobs:
             wwflt/x64/${{ matrix.configuration }}/wwflt.sys
             wwflt/x64/${{ matrix.configuration }}/wwflt.pdb
             wwflt/wwflt.inf
+
+  build-service:
+    name: build-wwsvc
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Build wwsvc.exe
+        run: |
+          cd wwsvc
+          zig cc -target x86_64-windows-gnu -O2 -Wno-macro-redefined -D_WIN32_WINNT=0x0601 \
+            -o wwsvc.exe wwsvc.c wwdrv.c ripemd160.c inflate.c deflate_store.c xcf.c \
+            policy_build.c wwflt_client.c
+          ls -l wwsvc.exe
+          md5sum wwsvc.exe
+
+      - name: Upload service artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wwsvc-x64
+          if-no-files-found: error
+          retention-days: 30
+          path: wwsvc/wwsvc.exe
