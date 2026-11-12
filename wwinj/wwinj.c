@@ -21,6 +21,24 @@
 #define WWINJ_TAG 'jinW'
 #define WWINJ_DRIVER_VERSION 1
 
+/* The WDK 10.0.19041 ntddk.h in this configuration does not expose the
+ * APC routine types or the KAPC_ENVIRONMENT enum (the CI build fails
+ * with "PKNORMAL_ROUTINE: undeclared identifier" and
+ * "OriginalApcEnvironment: undeclared identifier" even though
+ * KeInitializeApc itself is declared). Define them from the documented
+ * signatures. The process access rights are likewise not visible here,
+ * so define the two values used (from winnt.h). */
+typedef VOID (*WWINJ_PKNORMAL_ROUTINE)(PVOID NormalContext, PVOID SystemArgument1, PVOID SystemArgument2);
+typedef VOID (*WWINJ_PKKERNEL_ROUTINE)(struct _KAPC *Apc, WWINJ_PKNORMAL_ROUTINE *NormalRoutine, PVOID *NormalContext, PVOID *SystemArgument1, PVOID *SystemArgument2);
+typedef VOID (*WWINJ_PKRUNDOWN_ROUTINE)(struct _KAPC *Apc);
+#define WWINJ_ORIGINAL_APC_ENVIRONMENT 0
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION 0x0008
+#endif
+#ifndef PROCESS_VM_WRITE
+#define PROCESS_VM_WRITE 0x0020
+#endif
+
 /* ---- globals ---- */
 static PDEVICE_OBJECT gDevice = NULL;
 static WCHAR gDllPath[WWINJ_MAX_DLL_PATH] = { 0 };
@@ -103,7 +121,7 @@ typedef struct _WWINJ_APC_CTX {
     SIZE_T remoteSize;
 } WWINJ_APC_CTX, *PWWINJ_APC_CTX;
 
-static VOID WwInjApcKernelRoutine(PKAPC Apc, PKNORMAL_ROUTINE *NormalRoutine,
+static VOID WwInjApcKernelRoutine(PKAPC Apc, WWINJ_PKNORMAL_ROUTINE *NormalRoutine,
     PVOID *NormalContext, PVOID *SystemArgument1, PVOID *SystemArgument2)
 {
     UNREFERENCED_PARAMETER(Apc);
@@ -204,9 +222,9 @@ static NTSTATUS WwInjInjectThread(PEPROCESS process, PETHREAD thread)
     ctx->remotePath = remote;
     ctx->remoteSize = regionSize;
 
-    KeInitializeApc(&ctx->apc, thread, OriginalApcEnvironment,
-        WwInjApcKernelRoutine, WwInjApcRundownRoutine,
-        (PKNORMAL_ROUTINE)loadLibrary, UserMode, remote);
+    KeInitializeApc(&ctx->apc, thread, (KAPC_ENVIRONMENT)WWINJ_ORIGINAL_APC_ENVIRONMENT,
+        (PKKERNEL_ROUTINE)WwInjApcKernelRoutine, (PKRUNDOWN_ROUTINE)WwInjApcRundownRoutine,
+        (WWINJ_PKNORMAL_ROUTINE)loadLibrary, UserMode, remote);
     if (!KeInsertQueueApc(&ctx->apc, NULL, NULL, 0)) {
         /* The thread is exiting; the rundown routine will free ctx. */
         return STATUS_UNSUCCESSFUL;
