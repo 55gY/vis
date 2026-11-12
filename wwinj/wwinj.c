@@ -201,10 +201,13 @@ static NTSTATUS WwInjInjectThread(PEPROCESS process, PETHREAD thread)
         ZwClose(hProc);
         return st;
     }
-    /* Write the DLL path into the target process. */
+    /* Write the DLL path into the target process. MmCopyVirtualMemory
+     * is the kernel-mode copy primitive (ZwWriteVirtualMemory is not
+     * exported by ntoskrnl.lib in this WDK config). */
     {
         SIZE_T written = 0;
-        st = ZwWriteVirtualMemory(hProc, remote, localPath, pathBytes, &written);
+        st = MmCopyVirtualMemory(PsGetCurrentProcess(), localPath,
+            process, remote, pathBytes, KernelMode, &written);
         if (!NT_SUCCESS(st) || written != pathBytes) {
             SIZE_T sz = 0;
             PVOID base = remote;
@@ -244,14 +247,109 @@ static NTSTATUS WwInjInjectThread(PEPROCESS process, PETHREAD thread)
     return STATUS_SUCCESS;
 }
 
+/* ---- thread lookup (PsGetNextProcessThread is not in ntoskrnl.lib
+ * in this WDK config): find the first thread of a process by PID via
+ * ZwQuerySystemInformation(SystemProcessInformation). ---- */
+typedef struct _WWINJ_SYSTEM_THREAD_INFORMATION {
+    LARGE_INTEGER KernelTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER CreateTime;
+    ULONG WaitTime;
+    PVOID StartAddress;
+    CLIENT_ID ClientId;
+    KPRIORITY Priority;
+    LONG BasePriority;
+    ULONG ContextSwitches;
+    ULONG ThreadState;
+    KWAIT_REASON WaitReason;
+} WWINJ_SYSTEM_THREAD_INFORMATION, *PWWINJ_SYSTEM_THREAD_INFORMATION;
+
+typedef struct _WWINJ_SYSTEM_PROCESS_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    LARGE_INTEGER WorkingSetPrivateSize;
+    ULONG HardFaultCount;
+    ULONG NumberOfThreadsHighWatermark;
+    ULONGLONG CycleTime;
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING ImageName;
+    KPRIORITY BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+    ULONG HandleCount;
+    ULONG SessionId;
+    ULONG_PTR UniqueProcessKey;
+    SIZE_T PeakVirtualSize;
+    SIZE_T VirtualSize;
+    ULONG PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+    SIZE_T PrivatePageCount;
+    LARGE_INTEGER ReadOperationCount;
+    LARGE_INTEGER WriteOperationCount;
+    LARGE_INTEGER OtherOperationCount;
+    LARGE_INTEGER ReadTransferCount;
+    LARGE_INTEGER WriteTransferCount;
+    LARGE_INTEGER OtherTransferCount;
+    WWINJ_SYSTEM_THREAD_INFORMATION Threads[1];
+} WWINJ_SYSTEM_PROCESS_INFORMATION, *PWWINJ_SYSTEM_PROCESS_INFORMATION;
+
+/* Find the first thread of the process `pid`. Returns an NTSTATUS and,
+ * on success, a referenced PETHREAD in *thread_out. */
+static NTSTATUS WwInjFindFirstThread(HANDLE pid, PETHREAD *thread_out)
+{
+    NTSTATUS st;
+    ULONG size = 256 * 1024;
+    PVOID buf = NULL;
+    ULONG needed = 0;
+    PWWINJ_SYSTEM_PROCESS_INFORMATION proc;
+    *thread_out = NULL;
+
+    buf = ExAllocatePoolWithTag(PagedPool, size, WWINJ_TAG);
+    if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+    st = ZwQuerySystemInformation(SystemProcessInformation, buf, size, &needed);
+    if (st == STATUS_INFO_LENGTH_MISMATCH) {
+        ExFreePoolWithTag(buf, WWINJ_TAG);
+        size = needed;
+        buf = ExAllocatePoolWithTag(PagedPool, size, WWINJ_TAG);
+        if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+        st = ZwQuerySystemInformation(SystemProcessInformation, buf, size, &needed);
+    }
+    if (!NT_SUCCESS(st)) {
+        ExFreePoolWithTag(buf, WWINJ_TAG);
+        return st;
+    }
+    proc = (PWWINJ_SYSTEM_PROCESS_INFORMATION)buf;
+    for (;;) {
+        if (proc->UniqueProcessId == pid && proc->NumberOfThreads > 0) {
+            HANDLE tid = proc->Threads[0].ClientId.UniqueThread;
+            st = PsLookupThreadByThreadId(tid, thread_out);
+            ExFreePoolWithTag(buf, WWINJ_TAG);
+            return st;
+        }
+        if (proc->NextEntryOffset == 0) break;
+        proc = (PWWINJ_SYSTEM_PROCESS_INFORMATION)((PUCHAR)proc + proc->NextEntryOffset);
+    }
+    ExFreePoolWithTag(buf, WWINJ_TAG);
+    return STATUS_NOT_FOUND;
+}
+
 /* Try to inject into `process` via its first thread. */
 static NTSTATUS WwInjInjectProcess(PEPROCESS process)
 {
     PETHREAD thread = NULL;
     NTSTATUS st;
-    /* PsGetNextProcessThread enumerates the process's threads. */
-    thread = PsGetNextProcessThread(process, NULL);
-    if (!thread) return STATUS_NOT_FOUND;
+    HANDLE pid = PsGetProcessId(process);
+    st = WwInjFindFirstThread(pid, &thread);
+    if (!NT_SUCCESS(st)) return st;
     st = WwInjInjectThread(process, thread);
     ObDereferenceObject(thread);
     return st;
