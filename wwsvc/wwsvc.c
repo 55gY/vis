@@ -359,7 +359,10 @@ static void run_wwflt_body(void)
         return;
     }
     logf("wwflt: control device opened");
-    wwflt_set_log_level(hFlt, 1);
+    /* Log level 2: per-file policy events go to the driver's ring and
+     * are drained to wwflt.log (level 1 logs nothing per-file, so no
+     * wwflt.log is ever created -- that hid the 1.txt open failure). */
+    wwflt_set_log_level(hFlt, 2);
 
     /* 2. policy: try the server first (reserved; Phase 1: not configured),
      * fall back to the local .xcf. */
