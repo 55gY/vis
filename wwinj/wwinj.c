@@ -22,16 +22,28 @@
 #define WWINJ_DRIVER_VERSION 1
 
 /* The WDK 10.0.19041 ntddk.h in this configuration does not expose the
- * APC routine types or the KAPC_ENVIRONMENT enum (the CI build fails
- * with "PKNORMAL_ROUTINE: undeclared identifier" and
- * "OriginalApcEnvironment: undeclared identifier" even though
- * KeInitializeApc itself is declared). Define them from the documented
- * signatures. The process access rights are likewise not visible here,
- * so define the two values used (from winnt.h). */
+ * APC routine types, the KAPC_ENVIRONMENT enum, or (consequently) the
+ * KeInitializeApc / KeInsertQueueApc declarations at all -- the CI
+ * build fails with "PKNORMAL_ROUTINE / KAPC_ENVIRONMENT /
+ * PKKERNEL_ROUTINE: undeclared identifier" while the KeInitializeApc
+ * call itself only draws an implicit-declaration warning. So define
+ * the types and declare the two functions from the documented
+ * signatures (WWINJ_ prefixed types; the function names are the real
+ * ntoskrnl exports, so they link from ntoskrnl.lib). The process
+ * access rights are likewise not visible here, so define the two
+ * values used (from winnt.h). */
 typedef VOID (*WWINJ_PKNORMAL_ROUTINE)(PVOID NormalContext, PVOID SystemArgument1, PVOID SystemArgument2);
 typedef VOID (*WWINJ_PKKERNEL_ROUTINE)(struct _KAPC *Apc, WWINJ_PKNORMAL_ROUTINE *NormalRoutine, PVOID *NormalContext, PVOID *SystemArgument1, PVOID *SystemArgument2);
 typedef VOID (*WWINJ_PKRUNDOWN_ROUTINE)(struct _KAPC *Apc);
-#define WWINJ_ORIGINAL_APC_ENVIRONMENT 0
+typedef enum _WWINJ_KAPC_ENVIRONMENT {
+    WwinjOriginalApcEnvironment = 0,
+    WwinjAttachedApcEnvironment,
+    WwinjCurrentApcEnvironment,
+    WwinjInsertApcEnvironment
+} WWINJ_KAPC_ENVIRONMENT;
+VOID KeInitializeApc(struct _KAPC *Apc, struct _KTHREAD *Thread, WWINJ_KAPC_ENVIRONMENT Environment, WWINJ_PKKERNEL_ROUTINE KernelRoutine, WWINJ_PKRUNDOWN_ROUTINE RundownRoutine, WWINJ_PKNORMAL_ROUTINE NormalRoutine, KPROCESSOR_MODE ProcessorMode, PVOID NormalContext);
+BOOLEAN KeInsertQueueApc(struct _KAPC *Apc, PVOID SystemArgument1, PVOID SystemArgument2, KPRIORITY Increment);
+#define WWINJ_ORIGINAL_APC_ENVIRONMENT WwinjOriginalApcEnvironment
 #ifndef PROCESS_VM_OPERATION
 #define PROCESS_VM_OPERATION 0x0008
 #endif
@@ -223,7 +235,7 @@ static NTSTATUS WwInjInjectThread(PEPROCESS process, PETHREAD thread)
     ctx->remoteSize = regionSize;
 
     KeInitializeApc(&ctx->apc, thread, WWINJ_ORIGINAL_APC_ENVIRONMENT,
-        (PKKERNEL_ROUTINE)WwInjApcKernelRoutine, (PKRUNDOWN_ROUTINE)WwInjApcRundownRoutine,
+        WwInjApcKernelRoutine, WwInjApcRundownRoutine,
         (WWINJ_PKNORMAL_ROUTINE)loadLibrary, UserMode, remote);
     if (!KeInsertQueueApc(&ctx->apc, NULL, NULL, 0)) {
         /* The thread is exiting; the rundown routine will free ctx. */
