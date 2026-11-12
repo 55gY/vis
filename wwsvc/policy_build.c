@@ -214,6 +214,7 @@ static void pb_first_key(const char *key, const char *value, void *ctx)
 
 int policy_build_from_xcf(const xcf_t *x, WWFLT_POLICY **out_policy,
                           ULONG *out_count, char *out_group, size_t out_group_cap,
+                          const char *group_override,
                           char *err, size_t err_cap)
 {
     pb_table_t *t = NULL;
@@ -234,14 +235,28 @@ int policy_build_from_xcf(const xcf_t *x, WWFLT_POLICY **out_policy,
     cc.t = t;
     pb_walk_section(x, "Kernel", pb_collect_key, &cc);
 
-    /* 2. Active group from the User section (first entry). */
-    fc.out = group_gbk; fc.cap = sizeof(group_gbk); fc.found = 0;
-    pb_walk_section(x, "User", pb_first_key, &fc);
-    if (fc.found && group_gbk[0]) {
-        /* 3. Overlay the group's rules (group wins for programs it lists). */
-        pb_walk_section(x, group_gbk, pb_collect_key, &cc);
+    /* 2. Active group: an explicit -group= override wins; otherwise the
+     * first entry of the User section (vendor behaviour). "Kernel"/"main"
+     * means main policy only (no overlay). */
+    if (group_override && group_override[0]) {
+        if (ci_equal_n(group_override, "Kernel", 6) && group_override[6] == 0) {
+            strncpy(group_gbk, "Kernel", sizeof(group_gbk) - 1);
+        } else if (ci_equal_n(group_override, "main", 4) && group_override[4] == 0) {
+            strncpy(group_gbk, "Kernel", sizeof(group_gbk) - 1);
+        } else {
+            strncpy(group_gbk, group_override, sizeof(group_gbk) - 1);
+            group_gbk[sizeof(group_gbk) - 1] = 0;
+            pb_walk_section(x, group_gbk, pb_collect_key, &cc);
+        }
     } else {
-        strncpy(group_gbk, "Kernel", sizeof(group_gbk) - 1);
+        fc.out = group_gbk; fc.cap = sizeof(group_gbk); fc.found = 0;
+        pb_walk_section(x, "User", pb_first_key, &fc);
+        if (fc.found && group_gbk[0]) {
+            /* 3. Overlay the group's rules (group wins for programs it lists). */
+            pb_walk_section(x, group_gbk, pb_collect_key, &cc);
+        } else {
+            strncpy(group_gbk, "Kernel", sizeof(group_gbk) - 1);
+        }
     }
     if (out_group && out_group_cap) {
         strncpy(out_group, group_gbk, out_group_cap - 1);

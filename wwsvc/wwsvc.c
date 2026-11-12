@@ -80,6 +80,7 @@ static wchar_t g_exename[64] = L"wwsvc.exe";
 static char g_install_dir[MAX_PATH] = "D:\\visteam\\wwall";
 static char g_log_path[MAX_PATH] = { 0 };
 static int g_wwflt = 0;          /* -wwflt: new WWFilter driver mode (no vendor channel) */
+static char g_group_override[128] = { 0 };  /* -group=<name>: override the active .xcf group; empty = first User entry */
 
 /* ---------- logging ---------- */
 static void logf(const char *fmt, ...)
@@ -378,7 +379,7 @@ static void run_wwflt_body(void)
             CloseHandle(hFlt);
             return;
         }
-        if (policy_build_from_xcf(&x, &pol, &rule_count, group, sizeof(group), errbuf, sizeof(errbuf)) != 0) {
+        if (policy_build_from_xcf(&x, &pol, &rule_count, group, sizeof(group), g_group_override[0] ? g_group_override : NULL, errbuf, sizeof(errbuf)) != 0) {
             logf("wwflt: policy build failed: %s", errbuf);
             xcf_free(&x);
             CloseHandle(hFlt);
@@ -634,6 +635,11 @@ int main(int argc, char **argv)
                  strcmp(argv[i], "--wwflt") == 0) g_wwflt = 1;
         else if (strncmp(argv[i], "-dir=", 5) == 0) dir_arg = argv[i] + 5;
         else if (strncmp(argv[i], "--dir=", 6) == 0) dir_arg = argv[i] + 6;
+        else if (strncmp(argv[i], "-group=", 7) == 0) {
+            strncpy(g_group_override, argv[i] + 7, sizeof(g_group_override) - 1);
+        } else if (strncmp(argv[i], "--group=", 8) == 0) {
+            strncpy(g_group_override, argv[i] + 8, sizeof(g_group_override) - 1);
+        }
     }
     if (dir_arg && dir_arg[0]) {
         strncpy(g_install_dir, dir_arg, sizeof(g_install_dir) - 1);
