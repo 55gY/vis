@@ -366,15 +366,18 @@ static NTSTATUS WwInjInjectProcess(PEPROCESS process)
 static VOID WwInjCreateProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
 {
     UNREFERENCED_PARAMETER(Process);
+    UNREFERENCED_PARAMETER(ProcessId);
     if (!CreateInfo) return; /* process exit */
     InterlockedIncrement64((volatile LONGLONG *)&gProcessesSeen);
-    /* ImageFileName can be NULL for some creations; never deref it blind. */
-    if (!CreateInfo->ImageFileName || !CreateInfo->ImageFileName->Buffer) return;
-    if (!WwInjIsTarget(CreateInfo->ImageFileName->Buffer)) return;
-    if (WwInjAlreadyInjected(ProcessId)) return;
-    /* The initial thread may not exist yet; the thread notify below
-     * does the actual injection when it appears. Marking here only
-     * prevents duplicate attempts from racing notifications. */
+    /* Do NOT dereference CreateInfo->ImageFileName here. The 0x3B
+     * in MEMORY-wwinj-2.DMP proved it: the fault IP 0x133e is the
+     * `ImageFileName->Buffer` read, and the pointer is non-NULL yet
+     * points at unmapped memory for some creations (a NULL check
+     * does not help -- the pointer itself is dangling). The image
+     * name is only needed to decide whether to inject, and the
+     * thread notify below already does that safely via
+     * SeLocateProcessImageName, which returns a properly allocated
+     * UNICODE_STRING. This routine only counts. */
 }
 
 static VOID WwInjCreateThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
