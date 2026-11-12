@@ -1,13 +1,22 @@
 ; wwflt.inf -- WWFilter minifilter driver install file.
 ;
-; Install (testsigning on, or a properly signed build):
-;   Right-click -> Install, or:
-;     rundll32.exe setupapi,InstallHinfSection DefaultInstall 132 .\wwflt.inf
-;   Then load:
-;     fltmc load wwflt
-;   Unload / uninstall:
-;     fltmc unload wwflt
-;     rundll32.exe setupapi,InstallHinfSection DefaultUninstall 132 .\wwflt.inf
+; Install (testsigning on, or a properly signed build).
+; NOTE: rundll32 InstallHinfSection has a quirk -- it stores
+; ServiceBinary as a RELATIVE path (system32\DRIVERS\wwflt.sys),
+; which makes `fltmc load` fail with 0x80070002. Prefer one of:
+;   pnputil /add-driver wwflt.inf /install
+;     (expands DIRIDs correctly; then `fltmc load wwflt`), or
+;   copy wwflt.sys to C:\Windows\System32\drivers\ and
+;     sc create WWFilter type= kernel binPath= C:\Windows\System32\drivers\wwflt.sys
+;     (note the space after binPath=), then `sc start WWFilter`.
+;   If you already installed via rundll32 and the service path is
+;   relative, fix it with:
+;     sc config WWFilter binPath= C:\Windows\System32\drivers\wwflt.sys
+; Then load:
+;   fltmc load wwflt   (or sc start WWFilter if fltmc still errors)
+; Unload / uninstall:
+;   fltmc unload wwflt
+;   rundll32.exe setupapi,InstallHinfSection DefaultUninstall 132 .\wwflt.inf
 ;
 ; Altitude 141000 sits in the FSFilter Encryption range (140000-149999).
 ; It is a development value; a production altitude must be allocated by

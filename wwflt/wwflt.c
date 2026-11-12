@@ -604,6 +604,10 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostCreate(PFLT_CALLBACK_DATA Data, PCFLT_RE
                 ExAcquireResourceExclusiveLite(&sctx->lock, TRUE);
                 memcpy(sctx->key, key, WWFLT_KEY_SIZE);
                 WwSboxInit(&sctx->sbox, WWFLT_CURRENT_VERSION, key);
+                /* Publish: make the sbox/key stores visible before the
+                 * flag flips, so a lock-free reader that sees
+                 * is_encrypted==TRUE always sees a complete sbox. */
+                KeMemoryBarrier();
                 sctx->is_encrypted = TRUE;
                 sctx->header_written = TRUE;
                 ExReleaseResourceLite(&sctx->lock);
@@ -618,6 +622,8 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostCreate(PFLT_CALLBACK_DATA Data, PCFLT_RE
             ExAcquireResourceExclusiveLite(&sctx->lock, TRUE);
             memcpy(sctx->key, key, WWFLT_KEY_SIZE);
             WwSboxInit(&sctx->sbox, version, key);
+            /* Publish (see the new-file branch above). */
+            KeMemoryBarrier();
             sctx->is_encrypted = TRUE;
             sctx->header_written = TRUE;
             ExReleaseResourceLite(&sctx->lock);
@@ -701,9 +707,15 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostRead(PFLT_CALLBACK_DATA Data, PCFLT_RELA
         FltReleaseContext(sctx);
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
-    ExAcquireResourceSharedLite(&sctx->lock, TRUE);
+    /* NOTE: no lock here. The sbox is built once in WwPostCreate (under
+     * the stream lock, before is_encrypted is set) and never modified
+     * after that, so the decrypt path -- which runs at DISPATCH_LEVEL
+     * for paging I/O -- must not acquire the ERESOURCE (an ERESOURCE
+     * may only be acquired at IRQL <= APC_LEVEL; acquiring it at
+     * DISPATCH_LEVEL when contended faults the system). The
+     * is_encrypted flag, set after the sbox init under the lock plus a
+     * memory barrier, is the publication gate. */
     WwSboxDecrypt(&sctx->sbox, (UCHAR *)buf, len, (unsigned long long)logical_off);
-    ExReleaseResourceLite(&sctx->lock);
     InterlockedAdd64((volatile LONGLONG *)&gBytesDecrypted, len);
     FltReleaseContext(sctx);
     return FLT_POSTOP_FINISHED_PROCESSING;
@@ -780,9 +792,10 @@ static FLT_PREOP_CALLBACK_STATUS WwPreWrite(PFLT_CALLBACK_DATA Data, PCFLT_RELAT
         return FLT_PREOP_COMPLETE;
     }
     memcpy(wctx->swap_buffer, src_buf, len);
-    ExAcquireResourceSharedLite(&sctx->lock, TRUE);
+    /* NOTE: no lock here (see WwPostRead). The sbox is immutable after
+     * WwPostCreate publishes it, and this path runs at DISPATCH_LEVEL
+     * for paging I/O, where an ERESOURCE must not be acquired. */
     WwSboxEncrypt(&sctx->sbox, (UCHAR *)wctx->swap_buffer, len, (unsigned long long)logical_off);
-    ExReleaseResourceLite(&sctx->lock);
     /* Swap the buffer in. For MDL-based I/O, build an MDL for the swap
      * buffer and replace the IRP's MDL; for a user buffer, swap the pointer. */
     if (Data->Iopb->Parameters.Write.MdlAddress) {
@@ -848,9 +861,11 @@ static FLT_PREOP_CALLBACK_STATUS WwPreSetInfo(PFLT_CALLBACK_DATA Data, PCFLT_REL
     if (!sctx) return FLT_PREOP_SUCCESS_NO_CALLBACK;
     if (fic == FileEndOfFileInformation) {
         PFILE_END_OF_FILE_INFORMATION info = (PFILE_END_OF_FILE_INFORMATION)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+        if (!info) { FltReleaseContext(sctx); return FLT_PREOP_SUCCESS_NO_CALLBACK; }
         info->EndOfFile.QuadPart += WWFLT_HEADER_SIZE;
     } else {
         PFILE_ALLOCATION_INFORMATION info = (PFILE_ALLOCATION_INFORMATION)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+        if (!info) { FltReleaseContext(sctx); return FLT_PREOP_SUCCESS_NO_CALLBACK; }
         info->AllocationSize.QuadPart += WWFLT_HEADER_SIZE;
     }
     FltReleaseContext(sctx);
@@ -873,18 +888,21 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostQueryInfo(PFLT_CALLBACK_DATA Data, PCFLT
     if (!sctx) return FLT_POSTOP_FINISHED_PROCESSING;
     if (fic == FileStandardInformation) {
         PFILE_STANDARD_INFORMATION info = (PFILE_STANDARD_INFORMATION)Data->Iopb->Parameters.QueryFileInformation.InfoBuffer;
+        if (!info) { FltReleaseContext(sctx); return FLT_POSTOP_FINISHED_PROCESSING; }
         if (info->EndOfFile.QuadPart >= WWFLT_HEADER_SIZE) info->EndOfFile.QuadPart -= WWFLT_HEADER_SIZE;
         else info->EndOfFile.QuadPart = 0;
         if (info->AllocationSize.QuadPart >= WWFLT_HEADER_SIZE) info->AllocationSize.QuadPart -= WWFLT_HEADER_SIZE;
         else info->AllocationSize.QuadPart = 0;
     } else if (fic == FileAllInformation) {
         PFILE_ALL_INFORMATION info = (PFILE_ALL_INFORMATION)Data->Iopb->Parameters.QueryFileInformation.InfoBuffer;
+        if (!info) { FltReleaseContext(sctx); return FLT_POSTOP_FINISHED_PROCESSING; }
         if (info->StandardInformation.EndOfFile.QuadPart >= WWFLT_HEADER_SIZE) info->StandardInformation.EndOfFile.QuadPart -= WWFLT_HEADER_SIZE;
         else info->StandardInformation.EndOfFile.QuadPart = 0;
         if (info->StandardInformation.AllocationSize.QuadPart >= WWFLT_HEADER_SIZE) info->StandardInformation.AllocationSize.QuadPart -= WWFLT_HEADER_SIZE;
         else info->StandardInformation.AllocationSize.QuadPart = 0;
     } else if (fic == FileNetworkOpenInformation) {
         PFILE_NETWORK_OPEN_INFORMATION info = (PFILE_NETWORK_OPEN_INFORMATION)Data->Iopb->Parameters.QueryFileInformation.InfoBuffer;
+        if (!info) { FltReleaseContext(sctx); return FLT_POSTOP_FINISHED_PROCESSING; }
         if (info->EndOfFile.QuadPart >= WWFLT_HEADER_SIZE) info->EndOfFile.QuadPart -= WWFLT_HEADER_SIZE;
         else info->EndOfFile.QuadPart = 0;
         if (info->AllocationSize.QuadPart >= WWFLT_HEADER_SIZE) info->AllocationSize.QuadPart -= WWFLT_HEADER_SIZE;
