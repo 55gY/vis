@@ -339,6 +339,10 @@ static NTSTATUS WwInjFindFirstThread(HANDLE pid, PETHREAD *thread_out)
             return st;
         }
         if (proc->NextEntryOffset == 0) break;
+        /* Never walk past the end of the buffer: a corrupt or
+         * truncated entry chain must not turn into an out-of-bounds
+         * read (that is an access-violation BSOD). */
+        if (proc->NextEntryOffset > size - ((PUCHAR)proc - (PUCHAR)buf)) break;
         proc = (PWWINJ_SYSTEM_PROCESS_INFORMATION)((PUCHAR)proc + proc->NextEntryOffset);
     }
     ExFreePoolWithTag(buf, WWINJ_TAG);
@@ -364,6 +368,8 @@ static VOID WwInjCreateProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CR
     UNREFERENCED_PARAMETER(Process);
     if (!CreateInfo) return; /* process exit */
     InterlockedIncrement64((volatile LONGLONG *)&gProcessesSeen);
+    /* ImageFileName can be NULL for some creations; never deref it blind. */
+    if (!CreateInfo->ImageFileName || !CreateInfo->ImageFileName->Buffer) return;
     if (!WwInjIsTarget(CreateInfo->ImageFileName->Buffer)) return;
     if (WwInjAlreadyInjected(ProcessId)) return;
     /* The initial thread may not exist yet; the thread notify below
@@ -374,10 +380,20 @@ static VOID WwInjCreateProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CR
 static VOID WwInjCreateThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
 {
     PEPROCESS process = NULL;
+    PETHREAD thread = NULL;
     NTSTATUS st;
     PUNICODE_STRING image = NULL;
-    UNREFERENCED_PARAMETER(ThreadId);
+    KIRQL irql;
     if (!Create) return;
+    /* Skip everything until the service has configured a DLL path and
+     * at least one target; otherwise every thread creation in the
+     * system pays for a lookup and an injection attempt. */
+    KeAcquireSpinLock(&gCfgLock, &irql);
+    {
+        BOOLEAN configured = (gDllPath[0] != 0) && (gLoadLibraryW != NULL) && (gTargetCount > 0);
+        KeReleaseSpinLock(&gCfgLock, irql);
+        if (!configured) return;
+    }
     if (WwInjAlreadyInjected(ProcessId)) return;
     st = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(st)) return;
@@ -396,7 +412,21 @@ static VOID WwInjCreateThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN C
     /* Inject via this thread. Mark first so a second thread notify
      * for the same process does not queue a duplicate APC. */
     WwInjMarkInjected(ProcessId);
-    st = WwInjInjectProcess(process);
+    /* Use the thread being created directly (PsLookupThreadByThreadId
+     * on the notify's ThreadId). Do NOT enumerate all processes with
+     * ZwQuerySystemInformation here: it is heavy, takes the process
+     * list lock while a thread is being created, and can hand back a
+     * thread that is not fully initialised -- that is the 0x3B crash
+     * path. The ZwQuerySystemInformation lookup stays only in the
+     * IOCTL INJECT_PID path for already-running processes. */
+    st = PsLookupThreadByThreadId(ThreadId, &thread);
+    if (!NT_SUCCESS(st)) {
+        InterlockedIncrement64((volatile LONGLONG *)&gInjectionsFailed);
+        ObDereferenceObject(process);
+        return;
+    }
+    st = WwInjInjectThread(process, thread);
+    ObDereferenceObject(thread);
     if (NT_SUCCESS(st)) {
         InterlockedIncrement64((volatile LONGLONG *)&gInjectionsQueued);
     } else {
