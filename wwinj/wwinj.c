@@ -222,7 +222,7 @@ static NTSTATUS WwInjInjectThread(PEPROCESS process, PETHREAD thread)
     ctx->remotePath = remote;
     ctx->remoteSize = regionSize;
 
-    KeInitializeApc(&ctx->apc, thread, (KAPC_ENVIRONMENT)WWINJ_ORIGINAL_APC_ENVIRONMENT,
+    KeInitializeApc(&ctx->apc, thread, WWINJ_ORIGINAL_APC_ENVIRONMENT,
         (PKKERNEL_ROUTINE)WwInjApcKernelRoutine, (PKRUNDOWN_ROUTINE)WwInjApcRundownRoutine,
         (WWINJ_PKNORMAL_ROUTINE)loadLibrary, UserMode, remote);
     if (!KeInsertQueueApc(&ctx->apc, NULL, NULL, 0)) {
