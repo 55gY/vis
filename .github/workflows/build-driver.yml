@@ -113,9 +113,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.15.2
+        run: |
+          # Do NOT use mlugg/setup-zig: it fetches zig-linux-x86_64-*.tar.xz,
+          # a filename that does not exist (the release file is
+          # zig-x86_64-linux-*.tar.xz), so every mirror 404s. Download
+          # directly from ziglang.org instead.
+          curl -L -o /tmp/zig.tar.xz https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+          mkdir -p /tmp/zig
+          tar -xf /tmp/zig.tar.xz -C /tmp/zig --strip-components=1
+          echo "/tmp/zig" >> $GITHUB_PATH
+          zig version
 
       - name: Build wwsvc.exe
         run: |
