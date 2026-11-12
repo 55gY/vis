@@ -268,11 +268,18 @@ static NTSTATUS WwGetRequestorExe(PFLT_CALLBACK_DATA Data, PWSTR out, size_t out
 }
 
 /* Extract the extension (without the dot) from a file name.
- * Returns a pointer into a caller-provided buffer, or NULL if none. */
+ * Returns a pointer into a caller-provided buffer, or NULL if none.
+ * file_name may be NULL (e.g. FinalComponent.Buffer is NULL for a
+ * volume root or a path with no final component); that is not an
+ * error, it just has no extension. Never pass NULL to wcsrchr --
+ * the kernel's wcsrchr faults on a NULL string (BugCheck 0x3B). */
 static PCWSTR WwGetExtension(PCWSTR file_name, PWSTR ext_buf, size_t ext_chars)
 {
-    PCWSTR dot = wcsrchr(file_name, L'.');
-    PCWSTR slash = wcsrchr(file_name, L'\\');
+    PCWSTR dot;
+    PCWSTR slash;
+    if (!file_name || !*file_name) return NULL;
+    dot = wcsrchr(file_name, L'.');
+    slash = wcsrchr(file_name, L'\\');
     if (!dot || (slash && dot < slash)) return NULL;
     dot++;
     if (!*dot) return NULL;
@@ -297,7 +304,13 @@ typedef struct _WWFLT_STREAM_CTX {
     UCHAR key[WWFLT_KEY_SIZE];
     WW_SBOX_CTX sbox;
     WCHAR policy_name[WWFLT_MAX_GROUP_LEN]; /* e.g. L"NOTEPAD." */
-    ERESOURCE lock;                        /* guards header_written / sbox */
+    /* Spinlock, not ERESOURCE: the context cleanup runs at any IRQL
+     * (up to DISPATCH_LEVEL) and ExDeleteResourceLite is only valid
+     * at <= APC_LEVEL -- deleting an ERESOURCE from cleanup faulted
+     * the system (BugCheck 0xA in ExDeleteResourceLite). A spinlock
+     * needs no deletion and is safe at any IRQL. It guards the
+     * header/sbox setup in WwPostCreate (PASSIVE_LEVEL). */
+    KSPIN_LOCK lock;
 } WWFLT_STREAM_CTX;
 
 /* Forward declaration (used by gContextRegs below). */
@@ -308,8 +321,8 @@ static const FLT_CONTEXT_REGISTRATION gContextRegs[] = {
     { FLT_CONTEXT_END }
 };
 
-/* Context cleanup: free the ERESOURCE and let the Filter Manager free
- * the context memory itself. Called when the stream is torn down. */
+/* Context cleanup: just the open-file counter; the spinlock needs no
+ * teardown. Called when the stream is torn down, at any IRQL. */
 static VOID WwStreamContextCleanup(PFLT_CONTEXT ctx, FLT_CONTEXT_TYPE type)
 {
     WWFLT_STREAM_CTX *sctx = (WWFLT_STREAM_CTX *)ctx;
@@ -317,7 +330,6 @@ static VOID WwStreamContextCleanup(PFLT_CONTEXT ctx, FLT_CONTEXT_TYPE type)
     if (sctx->is_encrypted) {
         InterlockedDecrement(&gEncryptedFilesOpen);
     }
-    ExDeleteResourceLite(&sctx->lock);
 }
 
 /* Find the process rule for `exe` in the active policy table.
@@ -501,6 +513,13 @@ static FLT_PREOP_CALLBACK_STATUS WwPreCreate(PFLT_CALLBACK_DATA Data, PCFLT_RELA
         FltReleaseFileNameInformation(name_info);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
+    /* Name/FinalComponent can be NULL for a volume root, a path with
+     * no final component, or a non-file object. Let those through;
+     * WwGetExtension also NULL-checks, this is the outer guard. */
+    if (!name_info->Name.Buffer || !name_info->FinalComponent.Buffer) {
+        FltReleaseFileNameInformation(name_info);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
     if (!WwEvaluatePolicy(exe, name_info->Name.Buffer, name_info->FinalComponent.Buffer, &mode, policy_name, WWFLT_MAX_GROUP_LEN)) {
         FltReleaseFileNameInformation(name_info);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -519,10 +538,9 @@ static FLT_PREOP_CALLBACK_STATUS WwPreCreate(PFLT_CALLBACK_DATA Data, PCFLT_RELA
     sctx->header_checked = FALSE;
     KeInitializeEvent(&sctx->header_ready, NotificationEvent, FALSE);
     wcsncpy(sctx->policy_name, policy_name, WWFLT_MAX_GROUP_LEN - 1);
-    ExInitializeResourceLite(&sctx->lock);
+    KeInitializeSpinLock(&sctx->lock);
     st = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject, FLT_SET_CONTEXT_KEEP_IF_EXISTS, sctx, NULL);
     if (!NT_SUCCESS(st) && st != STATUS_FLT_CONTEXT_ALREADY_DEFINED) {
-        ExDeleteResourceLite(&sctx->lock);
         FltReleaseContext(sctx);
         FltReleaseFileNameInformation(name_info);
         InterlockedIncrement64((volatile LONGLONG *)&gErrors);
@@ -549,6 +567,7 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostCreate(PFLT_CALLBACK_DATA Data, PCFLT_RE
     UCHAR key[WWFLT_KEY_SIZE];
     int version = WWFLT_CURRENT_VERSION;
     BOOLEAN is_new = FALSE;
+    KIRQL irql;
     UNREFERENCED_PARAMETER(CompletionContext);
     UNREFERENCED_PARAMETER(Flags);
 
@@ -560,9 +579,9 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostCreate(PFLT_CALLBACK_DATA Data, PCFLT_RE
      * goes through our own write callback, which must not block on this
      * lock (it would deadlock). Later opens wait on header_ready so they
      * never do I/O before the header decision is final. */
-    ExAcquireResourceExclusiveLite(&sctx->lock, TRUE);
+    KeAcquireSpinLock(&sctx->lock, &irql);
     if (sctx->header_checked) {
-        ExReleaseResourceLite(&sctx->lock);
+        KeReleaseSpinLock(&sctx->lock, irql);
         /* Another post-create is doing (or did) the header work. Wait for
          * it (post-create runs at PASSIVE_LEVEL, so waiting is fine). */
         {
@@ -578,7 +597,7 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostCreate(PFLT_CALLBACK_DATA Data, PCFLT_RE
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
     sctx->header_checked = TRUE;
-    ExReleaseResourceLite(&sctx->lock);
+    KeReleaseSpinLock(&sctx->lock, irql);
     /* Was the file just created (empty)? */
     is_new = (Data->IoStatus.Information == FILE_CREATED);
     if (is_new) {
@@ -601,7 +620,7 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostCreate(PFLT_CALLBACK_DATA Data, PCFLT_RE
                 InterlockedIncrement64((volatile LONGLONG *)&gErrors);
             }
             if (header_ok) {
-                ExAcquireResourceExclusiveLite(&sctx->lock, TRUE);
+                KeAcquireSpinLock(&sctx->lock, &irql);
                 memcpy(sctx->key, key, WWFLT_KEY_SIZE);
                 WwSboxInit(&sctx->sbox, WWFLT_CURRENT_VERSION, key);
                 /* Publish: make the sbox/key stores visible before the
@@ -610,7 +629,7 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostCreate(PFLT_CALLBACK_DATA Data, PCFLT_RE
                 KeMemoryBarrier();
                 sctx->is_encrypted = TRUE;
                 sctx->header_written = TRUE;
-                ExReleaseResourceLite(&sctx->lock);
+                KeReleaseSpinLock(&sctx->lock, irql);
                 InterlockedIncrement(&gEncryptedFilesOpen);
             }
         }
@@ -619,14 +638,14 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostCreate(PFLT_CALLBACK_DATA Data, PCFLT_RE
         /* Existing file: read the header to see if it is encrypted. */
         st = WwReadHeader(FltObjects->Instance, FltObjects->FileObject, hdr);
         if (NT_SUCCESS(st) && WwParseHeader(hdr, key, &version)) {
-            ExAcquireResourceExclusiveLite(&sctx->lock, TRUE);
+            KeAcquireSpinLock(&sctx->lock, &irql);
             memcpy(sctx->key, key, WWFLT_KEY_SIZE);
             WwSboxInit(&sctx->sbox, version, key);
             /* Publish (see the new-file branch above). */
             KeMemoryBarrier();
             sctx->is_encrypted = TRUE;
             sctx->header_written = TRUE;
-            ExReleaseResourceLite(&sctx->lock);
+            KeReleaseSpinLock(&sctx->lock, irql);
             InterlockedIncrement(&gEncryptedFilesOpen);
         } else {
             /* Plaintext file (no header). Leave is_encrypted FALSE.
@@ -708,11 +727,9 @@ static FLT_POSTOP_CALLBACK_STATUS WwPostRead(PFLT_CALLBACK_DATA Data, PCFLT_RELA
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
     /* NOTE: no lock here. The sbox is built once in WwPostCreate (under
-     * the stream lock, before is_encrypted is set) and never modified
-     * after that, so the decrypt path -- which runs at DISPATCH_LEVEL
-     * for paging I/O -- must not acquire the ERESOURCE (an ERESOURCE
-     * may only be acquired at IRQL <= APC_LEVEL; acquiring it at
-     * DISPATCH_LEVEL when contended faults the system). The
+     * the stream spinlock, before is_encrypted is set) and never
+     * modified after that, so the decrypt path -- which runs at
+     * DISPATCH_LEVEL for paging I/O -- needs no lock at all. The
      * is_encrypted flag, set after the sbox init under the lock plus a
      * memory barrier, is the publication gate. */
     WwSboxDecrypt(&sctx->sbox, (UCHAR *)buf, len, (unsigned long long)logical_off);
@@ -793,8 +810,8 @@ static FLT_PREOP_CALLBACK_STATUS WwPreWrite(PFLT_CALLBACK_DATA Data, PCFLT_RELAT
     }
     memcpy(wctx->swap_buffer, src_buf, len);
     /* NOTE: no lock here (see WwPostRead). The sbox is immutable after
-     * WwPostCreate publishes it, and this path runs at DISPATCH_LEVEL
-     * for paging I/O, where an ERESOURCE must not be acquired. */
+     * WwPostCreate publishes it, so this DISPATCH_LEVEL path needs
+     * no lock at all. */
     WwSboxEncrypt(&sctx->sbox, (UCHAR *)wctx->swap_buffer, len, (unsigned long long)logical_off);
     /* Swap the buffer in. For MDL-based I/O, build an MDL for the swap
      * buffer and replace the IRP's MDL; for a user buffer, swap the pointer. */
