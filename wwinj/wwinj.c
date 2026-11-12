@@ -50,6 +50,9 @@ BOOLEAN KeInsertQueueApc(struct _KAPC *Apc, PVOID SystemArgument1, PVOID SystemA
 #ifndef PROCESS_VM_WRITE
 #define PROCESS_VM_WRITE 0x0020
 #endif
+/* SYSTEM_INFORMATION_CLASS value for SystemProcessInformation (=5);
+ * the enum is not exposed by ntddk.h in this config. */
+#define WWINJ_SYSTEM_PROCESS_INFORMATION 5
 
 /* ---- globals ---- */
 static PDEVICE_OBJECT gDevice = NULL;
@@ -315,13 +318,13 @@ static NTSTATUS WwInjFindFirstThread(HANDLE pid, PETHREAD *thread_out)
 
     buf = ExAllocatePoolWithTag(PagedPool, size, WWINJ_TAG);
     if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
-    st = ZwQuerySystemInformation(SystemProcessInformation, buf, size, &needed);
+    st = ZwQuerySystemInformation(WWINJ_SYSTEM_PROCESS_INFORMATION, buf, size, &needed);
     if (st == STATUS_INFO_LENGTH_MISMATCH) {
         ExFreePoolWithTag(buf, WWINJ_TAG);
         size = needed;
         buf = ExAllocatePoolWithTag(PagedPool, size, WWINJ_TAG);
         if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
-        st = ZwQuerySystemInformation(SystemProcessInformation, buf, size, &needed);
+        st = ZwQuerySystemInformation(WWINJ_SYSTEM_PROCESS_INFORMATION, buf, size, &needed);
     }
     if (!NT_SUCCESS(st)) {
         ExFreePoolWithTag(buf, WWINJ_TAG);
