@@ -408,7 +408,13 @@ static void run_wwflt_body(void)
         pol = NULL;
     }
 
-    /* 4. drain the event ring until stopped */
+    /* 4. drain the event ring until stopped. Clear wwflt.log first so
+     * each run starts fresh (user request: old entries confused
+     * diagnosis); the drain appends after this. */
+    {
+        FILE *clr = fopen("wwflt.log", "w");
+        if (clr) fclose(clr);
+    }
     logf("wwflt: running (draining event ring to wwflt.log) -- press Ctrl+C or stop the service");
     while (WaitForSingleObject(g_hStop, 2000) == WAIT_TIMEOUT) {
         err = wwflt_get_events(hFlt, 256, events, &ev_count, &ev_dropped);
@@ -666,7 +672,9 @@ int main(int argc, char **argv)
 
     if (want_console) {
         g_console = 1;
-        g_log = fopen(g_log_path, "a");
+        /* Clear the service log on startup so each run starts fresh
+         * (user request: old entries confused diagnosis). */
+        g_log = fopen(g_log_path, "w");
         SetConsoleCtrlHandler(console_ctrl, TRUE);
         logf("wwsvc console mode (log: %s)", g_log_path);
         run_service_body();
@@ -680,7 +688,7 @@ int main(int argc, char **argv)
             { (LPSTR)SVC_NAME, svc_main },
             { NULL, NULL }
         };
-        g_log = fopen(g_log_path, "a");
+        g_log = fopen(g_log_path, "w");
         if (!StartServiceCtrlDispatcherA(table)) {
             DWORD err = GetLastError();
             if (err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
