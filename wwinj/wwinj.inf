@@ -1,0 +1,55 @@
+; wwinj.inf -- WWInject injection driver install file.
+; This is a plain legacy kernel driver (NOT a minifilter): no FltMgr,
+; no altitude, no filter instances.
+;
+; Install (testsigning on, or a properly signed build):
+;   copy wwinj.sys to C:\Windows\System32\drivers\ and
+;     sc create WWInject type= kernel binPath= C:\Windows\System32\drivers\wwinj.sys
+;     (note the space after binPath=), then `sc start WWInject`.
+;   or: pnputil /add-driver wwinj.inf /install
+; Unload / uninstall:
+;   sc stop WWInject
+;   sc delete WWInject
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/12/2026,1.0.0.0
+CatalogFile = wwinj.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[DefaultInstall]
+OptionDesc = %ServiceDesc%
+CopyFiles  = @wwinj.sys
+
+[DefaultInstall.Services]
+AddService = WWInject, , WWInject.Service
+
+[DefaultUninstall]
+DelFiles   = @wwinj.sys
+
+[DefaultUninstall.Services]
+DelService = WWInject, 0x200
+
+[WWInject.Service]
+DisplayName    = %ServiceDesc%
+Description    = %ServiceDesc%
+ServiceType    = 1    ; SERVICE_KERNEL_DRIVER
+StartType      = 3    ; SERVICE_DEMAND_START
+ErrorControl   = 1    ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\wwinj.sys
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+wwinj.sys = 1,,
+
+[Strings]
+Provider     = "WWInject"
+ServiceDesc  = "WWInject DLL injection driver"
+DiskName     = "WWInject install media"

@@ -1,9 +1,11 @@
-# Build the WWFilter minifilter driver (Windows, WDK) and the wwsvc service
-# (Linux, Zig cross-compile) on GitHub Actions.
+# Build the WWFilter minifilter driver (Windows, WDK), the WWInject
+# injection driver (Windows, WDK), and the wwsvc service + wweng64.dll
+# engine DLL (Linux, Zig cross-compile) on GitHub Actions.
 # The windows-2022 runner comes with Visual Studio 2022 pre-installed, but
 # NOT the Windows Driver Kit (WDK). The workflow installs the WDK via
 # Chocolatey first (this is what provides fltKernel.h / fltMgr.lib).
-# Output: wwflt.sys (Release/Debug, x64) + wwsvc.exe (x64), uploaded as artifacts.
+# Output: wwflt.sys + wwinj.sys (Release/Debug, x64) + wwsvc.exe +
+# wweng64.dll (x64), uploaded as artifacts.
 name: Build WWFilter driver and service
 
 on:
@@ -11,12 +13,16 @@ on:
     branches: ["main"]
     paths:
       - "wwflt/**"
+      - "wwinj/**"
+      - "wweng/**"
       - "wwsvc/**"
       - ".github/workflows/build-driver.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "wwflt/**"
+      - "wwinj/**"
+      - "wweng/**"
       - "wwsvc/**"
   workflow_dispatch:
 
@@ -104,6 +110,44 @@ jobs:
             wwflt/x64/${{ matrix.configuration }}/wwflt.pdb
             wwflt/wwflt.inf
 
+      - name: Build wwinj solution
+        run: |
+          msbuild ./wwinj/wwinj.sln /m /t:Rebuild `
+            /nodeReuse:false `
+            /p:Configuration=${{ matrix.configuration }} `
+            /p:Platform=${{ env.PLATFORM }} `
+            /p:PreferredToolArchitecture=x64
+
+      - name: Link wwinj driver
+        shell: pwsh
+        run: |
+          # Same explicit-link workaround as wwflt, but wwinj is a plain
+          # legacy driver: no fltMgr.lib, only ntoskrnl.lib.
+          $vsPath = & "C:\ProgramData\Chocolatey\bin\vswhere.exe" -products * -requires Microsoft.Component.MSBuild -property installationPath -latest -version "[17.0,18.0)"
+          $linkExe = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Recurse -Filter "link.exe" | Where-Object { $_.FullName -match "HostX64\\x64" } | Sort-Object { [version]($_.Directory.Parent.Parent.Parent.Name) } -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $linkExe) { throw "link.exe not found" }
+          $cfg = "${{ matrix.configuration }}"
+          $outDir = "wwinj\x64\$cfg"
+          $wdkLib = "C:\Program Files (x86)\Windows Kits\10\Lib\10.0.19041.0\km\x64"
+          $objs = Get-ChildItem -Path $outDir -Filter "*.obj" | ForEach-Object { $_.FullName }
+          if ($objs.Count -eq 0) { throw "no .obj files in $outDir" }
+          Write-Host "Linking $($objs.Count) objects with $linkExe"
+          & $linkExe /NOLOGO /OUT:"$outDir\wwinj.sys" /SUBSYSTEM:NATIVE /DRIVER:WDM /ENTRY:DriverEntry /NODEFAULTLIB /MACHINE:X64 /DEBUG /PDB:"$outDir\wwinj.pdb" /OPT:REF /OPT:ICF $objs "$wdkLib\ntoskrnl.lib" "$wdkLib\BufferOverflowK.lib"
+          if ($LASTEXITCODE -ne 0) { throw "link failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path "$outDir\wwinj.sys")) { throw "wwinj.sys was not created" }
+          Write-Host "wwinj.sys OK: $((Get-Item "$outDir\wwinj.sys").Length) bytes"
+
+      - name: Upload wwinj artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wwinj-${{ matrix.configuration }}-x64
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            wwinj/x64/${{ matrix.configuration }}/wwinj.sys
+            wwinj/x64/${{ matrix.configuration }}/wwinj.pdb
+            wwinj/wwinj.inf
+
   build-service:
     name: build-wwsvc
     runs-on: ubuntu-latest
@@ -132,9 +176,18 @@ jobs:
           cd wwsvc
           zig cc -target x86_64-windows-gnu -O2 -Wno-macro-redefined -D_WIN32_WINNT=0x0601 \
             -o wwsvc.exe wwsvc.c wwdrv.c ripemd160.c inflate.c deflate_store.c xcf.c \
-            policy_build.c wwflt_client.c
+            policy_build.c wwflt_client.c wwinj_client.c
           ls -l wwsvc.exe
           md5sum wwsvc.exe
+
+      - name: Build wweng64.dll
+        run: |
+          cd wweng
+          zig cc -target x86_64-windows-gnu -O2 -shared -Wno-macro-redefined -D_WIN32_WINNT=0x0601 \
+            -o wweng64.dll wweng.c iat.c policy.c sbox.c xcf.c inflate.c deflate_store.c policy_build.c \
+            -lpsapi -ladvapi32
+          ls -l wweng64.dll
+          md5sum wweng64.dll
 
       - name: Upload service artifact
         uses: actions/upload-artifact@v4
@@ -142,4 +195,6 @@ jobs:
           name: wwsvc-x64
           if-no-files-found: error
           retention-days: 30
-          path: wwsvc/wwsvc.exe
+          path: |
+            wwsvc/wwsvc.exe
+            wweng/wweng64.dll

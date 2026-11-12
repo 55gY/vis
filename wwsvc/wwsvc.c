@@ -56,6 +56,7 @@
 #include "deflate_store.h"
 #include "policy_build.h"
 #include "wwflt_client.h"
+#include "wwinj_client.h"
 
 /* main policy group name, GBK bytes for "主加密策略" (10 bytes).
  * NOTE: the policy takeover that used to move every User entry to this
@@ -80,6 +81,7 @@ static wchar_t g_exename[64] = L"wwsvc.exe";
 static char g_install_dir[MAX_PATH] = "D:\\visteam\\wwall";
 static char g_log_path[MAX_PATH] = { 0 };
 static int g_wwflt = 0;          /* -wwflt: new WWFilter driver mode (no vendor channel) */
+static int g_wwinj = 0;          /* -wwinj: injection driver + engine DLL mode (no vendor channel) */
 static char g_group_override[128] = { 0 };  /* -group=<name>: override the active .xcf group; empty = first User entry */
 
 /* ---------- logging ---------- */
@@ -433,6 +435,160 @@ static void run_wwflt_body(void)
     CloseHandle(hFlt);
 }
 
+/* ---------- WWInject driver + engine DLL mode (-wwinj) ---------- */
+/* Vendor-style architecture, all our own code: the WWInject driver
+ * injects wweng64.dll into target processes (APC + LoadLibraryW); the
+ * engine DLL hooks file APIs and does transparent encryption/decryption
+ * per .xcf policy. The service starts the driver, configures the DLL
+ * path (+ LoadLibraryW address) and the target exe list (from the
+ * policy: every process with an Encrypt rule), injects into matching
+ * processes that are already running, then reports driver status until
+ * stopped. The engine DLL reads the .xcf itself (next to the DLL) for
+ * its policy; the driver only needs exe names to decide whom to inject.
+ * The driver keeps watching for new target processes after we exit. */
+static void run_wwinj_body(void)
+{
+    HANDLE hInj = INVALID_HANDLE_VALUE;
+    char xcf_path[MAX_PATH];
+    char group[128] = { 0 };
+    char errbuf[256] = { 0 };
+    WWFLT_POLICY *pol = NULL;
+    ULONG rule_count = 0;
+    DWORD err;
+    xcf_t x;
+    WWINJ_TARGETS targets;
+    WCHAR dll_path_w[MAX_PATH];
+    HMODULE k32;
+    ULONGLONG load_library_w = 0;
+
+    logf("=== wwinj mode: WWInject driver + engine DLL (no vendor channel) ===");
+
+    /* 1. start the driver */
+    err = wwinj_start_driver();
+    if (err != 0) {
+        logf("wwinj: cannot start WWInject driver err=%lu (is wwinj.sys installed?)", err);
+        return;
+    }
+    logf("wwinj: driver started");
+    hInj = wwinj_open();
+    if (hInj == INVALID_HANDLE_VALUE) {
+        logf("wwinj: cannot open \\\\.\\WWInject err=%lu", GetLastError());
+        return;
+    }
+    logf("wwinj: control device opened");
+
+    /* 2. build the policy from the local .xcf (for the target exe list) */
+    snprintf(xcf_path, sizeof(xcf_path), "%s\\wwkrn.xcf", g_install_dir);
+    if (xcf_load(xcf_path, &x) != 0) {
+        logf("wwinj: cannot load %s -- no target list (driver injects nothing)", xcf_path);
+        CloseHandle(hInj);
+        return;
+    }
+    if (policy_build_from_xcf(&x, &pol, &rule_count, group, sizeof(group),
+                              g_group_override[0] ? g_group_override : NULL,
+                              errbuf, sizeof(errbuf)) != 0) {
+        logf("wwinj: policy build failed: %s", errbuf);
+        xcf_free(&x);
+        CloseHandle(hInj);
+        return;
+    }
+    xcf_free(&x);
+    logf("wwinj: policy built from %s (group='%s', %lu process rules)", xcf_path, group, rule_count);
+
+    /* 3. DLL path + LoadLibraryW address. kernel32.dll is mapped at the
+     * same base in all processes (per-boot ASLR slide), so the address
+     * taken here is valid in the target process too. */
+    {
+        char dll_path_a[MAX_PATH];
+        snprintf(dll_path_a, sizeof(dll_path_a), "%s\\wweng64.dll", g_install_dir);
+        MultiByteToWideChar(CP_ACP, 0, dll_path_a, -1, dll_path_w, MAX_PATH);
+        k32 = GetModuleHandleW(L"kernel32.dll");
+        if (k32) {
+            load_library_w = (ULONGLONG)(ULONG_PTR)GetProcAddress(k32, "LoadLibraryW");
+        }
+    }
+    if (!load_library_w) {
+        logf("wwinj: cannot resolve LoadLibraryW");
+        free(pol);
+        CloseHandle(hInj);
+        return;
+    }
+    err = wwinj_set_dll_path(hInj, dll_path_w, load_library_w);
+    if (err != 0) {
+        logf("wwinj: SET_DLL_PATH failed err=%lu", err);
+        free(pol);
+        CloseHandle(hInj);
+        return;
+    }
+    logf("wwinj: DLL path set (%ls)", dll_path_w);
+
+    /* 4. targets: every process in the policy with an Encrypt rule. */
+    {
+        ULONG i, n = 0;
+        memset(&targets, 0, sizeof(targets));
+        for (i = 0; i < pol->proc_count && n < WWINJ_MAX_TARGETS; i++) {
+            if (pol->procs[i].encrypt_mode == WWFLT_ENCRYPT_NONE) continue;
+            wcsncpy(targets.exe[n], pol->procs[i].exe, WWINJ_MAX_EXE_LEN - 1);
+            n++;
+        }
+        targets.count = n;
+    }
+    err = wwinj_set_targets(hInj, &targets);
+    if (err != 0) {
+        logf("wwinj: SET_TARGETS failed err=%lu", err);
+        free(pol);
+        CloseHandle(hInj);
+        return;
+    }
+    logf("wwinj: %lu target(s) configured", targets.count);
+    for (ULONG i = 0; i < targets.count; i++) {
+        logf("wwinj:   target %lu: %ls", i + 1, targets.exe[i]);
+    }
+    free(pol);
+    pol = NULL;
+
+    /* 5. inject into matching processes that are already running. */
+    {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe;
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    ULONG i;
+                    for (i = 0; i < targets.count; i++) {
+                        if (_wcsicmp(pe.szExeFile, targets.exe[i]) == 0) {
+                            LONG st = 0;
+                            err = wwinj_inject_pid(hInj, pe.th32ProcessID, &st);
+                            if (err == 0) {
+                                logf("wwinj: inject pid=%lu (%ls) status=0x%08lx",
+                                     pe.th32ProcessID, pe.szExeFile, (unsigned long)st);
+                            } else {
+                                logf("wwinj: inject pid=%lu failed err=%lu",
+                                     pe.th32ProcessID, err);
+                            }
+                            break;
+                        }
+                    }
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+        }
+    }
+
+    /* 6. report status until stopped. */
+    logf("wwinj: running (driver watches for new target processes) -- press Ctrl+C or stop the service");
+    while (WaitForSingleObject(g_hStop, 5000) == WAIT_TIMEOUT) {
+        WWINJ_STATUS st;
+        if (wwinj_get_status(hInj, &st) == 0) {
+            logf("wwinj: status seen=%llu queued=%llu failed=%llu targets=%lu",
+                 st.processes_seen, st.injections_queued, st.injections_failed, st.target_count);
+        }
+    }
+    logf("wwinj: stopping (driver keeps watching with the last config)");
+    CloseHandle(hInj);
+}
+
 /* ---------- main service body (shared by console + service mode) ---------- */
 static void run_service_body(void)
 {
@@ -457,6 +613,14 @@ static void run_service_body(void)
      * wwkernel, USB policy, waiters). The WWFilter driver is the engine. */
     if (g_wwflt) {
         run_wwflt_body();
+        if (hMutex) CloseHandle(hMutex);
+        logf("=== wwsvc stopped ===");
+        return;
+    }
+    /* Injection-driver mode: the WWInject driver injects the engine DLL;
+     * no vendor channel either. */
+    if (g_wwinj) {
+        run_wwinj_body();
         if (hMutex) CloseHandle(hMutex);
         logf("=== wwsvc stopped ===");
         return;
@@ -639,6 +803,8 @@ int main(int argc, char **argv)
             strcmp(argv[i], "-c") == 0) want_console = 1;
         else if (strcmp(argv[i], "-wwflt") == 0 ||
                  strcmp(argv[i], "--wwflt") == 0) g_wwflt = 1;
+        else if (strcmp(argv[i], "-wwinj") == 0 ||
+                 strcmp(argv[i], "--wwinj") == 0) g_wwinj = 1;
         else if (strncmp(argv[i], "-dir=", 5) == 0) dir_arg = argv[i] + 5;
         else if (strncmp(argv[i], "--dir=", 6) == 0) dir_arg = argv[i] + 6;
         else if (strncmp(argv[i], "-group=", 7) == 0) {
