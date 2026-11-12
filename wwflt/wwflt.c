@@ -521,15 +521,19 @@ static FLT_PREOP_CALLBACK_STATUS WwPreCreate(PFLT_CALLBACK_DATA Data, PCFLT_RELA
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
     if (!WwEvaluatePolicy(exe, name_info->Name.Buffer, name_info->FinalComponent.Buffer, &mode, policy_name, WWFLT_MAX_GROUP_LEN)) {
-        /* Diagnostic: log every notepad.exe open (match or not) so a "no
-         * POLICY event" failure can be told apart from "policy matched
-         * but the read/write path failed". A match logs with an empty
-         * path below; a non-match logs here with the file name in path
-         * and status 0. If the exe is not notepad.exe here, the requestor
-         * is a different process than the user expects. */
-        if (gLogLevel >= 2 && WwWcsIcmp(exe, L"notepad.exe") == 0) {
-            WwLogEvent(WWFLT_EVENT_POLICY, HandleToUlong(PsGetCurrentProcessId()),
-                       exe, name_info->FinalComponent.Buffer, 0, 0, (NTSTATUS)0);
+        /* Diagnostic: log every .txt open by any process (match or not)
+         * with the requestor exe and the FULL path, so a "no POLICY
+         * event" failure can be told apart from "policy matched but the
+         * read/write path failed" and from "the file was never opened
+         * through this filter at all". A match logs with an empty path
+         * below; a non-match logs here with the full path and status 0. */
+        if (gLogLevel >= 2) {
+            WCHAR ext_dbg[WWFLT_MAX_EXT_LEN];
+            if (WwGetExtension(name_info->FinalComponent.Buffer, ext_dbg, WWFLT_MAX_EXT_LEN) &&
+                WwWcsIcmp(ext_dbg, L"txt") == 0) {
+                WwLogEvent(WWFLT_EVENT_POLICY, HandleToUlong(PsGetCurrentProcessId()),
+                           exe, name_info->Name.Buffer, 0, 0, (NTSTATUS)0);
+            }
         }
         FltReleaseFileNameInformation(name_info);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
