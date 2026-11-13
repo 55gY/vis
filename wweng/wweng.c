@@ -97,6 +97,9 @@ typedef NTSTATUS (NTAPI *NtWriteFile_t)(HANDLE, HANDLE, PVOID, PVOID, PWW_IO_STA
 typedef NTSTATUS (NTAPI *NtClose_t)(HANDLE);
 typedef NTSTATUS (NTAPI *NtSetInformationFile_t)(HANDLE, PWW_IO_STATUS_BLOCK, PVOID, ULONG, WW_FILE_INFORMATION_CLASS);
 typedef NTSTATUS (NTAPI *NtQueryInformationFile_t)(HANDLE, PWW_IO_STATUS_BLOCK, PVOID, ULONG, WW_FILE_INFORMATION_CLASS);
+typedef NTSTATUS (NTAPI *NtCreateSection_t)(PHANDLE, ACCESS_MASK, PWW_OBJECT_ATTRIBUTES, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+typedef NTSTATUS (NTAPI *NtMapViewOfSection_t)(HANDLE, HANDLE, PVOID *, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, ULONG);
+typedef NTSTATUS (NTAPI *NtUnmapViewOfSection_t)(HANDLE, PVOID);
 
 static NtCreateFile_t gOrigNtCreateFile = NULL;
 static NtOpenFile_t gOrigNtOpenFile = NULL;
@@ -105,6 +108,9 @@ static NtWriteFile_t gOrigNtWriteFile = NULL;
 static NtClose_t gOrigNtClose = NULL;
 static NtSetInformationFile_t gOrigNtSetInformationFile = NULL;
 static NtQueryInformationFile_t gOrigNtQueryInformationFile = NULL;
+static NtCreateSection_t gOrigNtCreateSection = NULL;
+static NtMapViewOfSection_t gOrigNtMapViewOfSection = NULL;
+static NtUnmapViewOfSection_t gOrigNtUnmapViewOfSection = NULL;
 
 /* Convert an NT path (\??\C:\... or \DosDevices\C:\...) to a Win32
  * path (C:\...). Returns FALSE if it is not a Win32-style path. */
@@ -431,6 +437,7 @@ static void WwEngOnCreate(HANDLE h, LPCWSTR lpFileName, DWORD dwDesiredAccess,
     }
     if (fileSize.QuadPart < WWFLT_HEADER_SIZE) {
         /* Too small to carry a header: plaintext, no conversion. */
+        WwEngLog(2, "create: reopen %ls phys=%lld < 512, no ctx", lpFileName, fileSize.QuadPart);
         return;
     }
     /* Existing file: probe the first 512 bytes for the magic. */
@@ -440,11 +447,13 @@ static void WwEngOnCreate(HANDLE h, LPCWSTR lpFileName, DWORD dwDesiredAccess,
         gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
         ok = gOrigReadFile(h, hdr, WWFLT_HEADER_SIZE, &read, NULL);
         if (!ok || read != WWFLT_HEADER_SIZE) {
+            WwEngLog(2, "create: reopen %ls phys=%lld probe read=%lu ok=%d, no ctx", lpFileName, fileSize.QuadPart, read, ok ? 1 : 0);
             gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
             return;
         }
         if (!WwEngParseHeader(hdr, key, &version)) {
             /* Not an encrypted file: restore position to 0 and pass through. */
+            WwEngLog(2, "create: reopen %ls phys=%lld magic mismatch, no ctx", lpFileName, fileSize.QuadPart);
             gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
             return;
         }
@@ -1141,6 +1150,115 @@ static NTSTATUS NTAPI WwHookNtClose(HANDLE Handle)
     return gOrigNtClose(Handle);
 }
 
+/* ---- Memory-mapped reads ----
+ * A reader that maps the file (Notepad does this) never calls
+ * NtReadFile, so the read hook never sees the content. The vendor
+ * handles this in its NtCreateSection hook (FUN_18002a870 ->
+ * FUN_18002a6a0): it builds the section, maps it, decrypts the
+ * mapped view in place, then unmaps. We do the safer equivalent:
+ * for an encrypted file, read the content, decrypt it, and hand
+ * the caller an anonymous (pagefile-backed) section holding the
+ * plaintext. The caller maps it and sees plaintext; writes to
+ * the mapping do not touch the encrypted file on disk (a
+ * limitation: mapped writes are not written back -- Notepad
+ * saves through NtWriteFile, which is hooked, so this is fine
+ * for the target apps). SEC_IMAGE sections and anonymous sections
+ * pass through untouched. */
+static NTSTATUS NTAPI WwHookNtCreateSection(PHANDLE SectionHandle, ACCESS_MASK DesiredAccess,
+    PWW_OBJECT_ATTRIBUTES ObjectAttributes, PLARGE_INTEGER MaximumSize,
+    ULONG SectionPageProtection, ULONG AllocationAttributes, HANDLE FileHandle)
+{
+    WW_FILE_CTX *ctx;
+    NTSTATUS st;
+    LONGLONG phys_size = 0;
+    LONGLONG logical_size = 0;
+    unsigned char *buf = NULL;
+    HANDLE anon = NULL;
+    LARGE_INTEGER maxsz;
+    PVOID base = NULL;
+    SIZE_T viewsz = 0;
+    LARGE_INTEGER secoff;
+
+    if (!FileHandle) {
+        return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
+                                    MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
+    }
+    /* SEC_IMAGE = an executable image being loaded: never touch. */
+    if (AllocationAttributes & 0x1000000 /* SEC_IMAGE */) {
+        return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
+                                    MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
+    }
+    EnterCriticalSection(&gCtxLock);
+    ctx = WwEngFindCtx(FileHandle);
+    if (!ctx || !ctx->is_encrypted) {
+        LeaveCriticalSection(&gCtxLock);
+        return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
+                                    MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
+    }
+    /* Physical size, then logical = physical - 512. */
+    if (!NtGetFileSizeRaw(FileHandle, &phys_size) || phys_size < WWFLT_HEADER_SIZE) {
+        LeaveCriticalSection(&gCtxLock);
+        return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
+                                    MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
+    }
+    logical_size = phys_size - WWFLT_HEADER_SIZE;
+    if (logical_size <= 0) {
+        /* Empty content: hand back an anonymous 1-byte section so
+         * the caller maps an empty view instead of the raw header. */
+        logical_size = 0;
+    }
+    /* Read the ciphertext (physical, offset 512) and decrypt it. */
+    buf = (unsigned char *)malloc((size_t)(logical_size > 0 ? logical_size : 1));
+    if (!buf) {
+        LeaveCriticalSection(&gCtxLock);
+        return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
+                                    MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
+    }
+    if (logical_size > 0) {
+        LARGE_INTEGER phys;
+        WW_IO_STATUS_BLOCK iosb;
+        phys.QuadPart = WWFLT_HEADER_SIZE;
+        st = gOrigNtReadFile(FileHandle, NULL, NULL, NULL, &iosb,
+                             buf, (ULONG)logical_size, &phys, NULL);
+        if (!WW_NT_SUCCESS(st) || (LONGLONG)iosb.Information != logical_size) {
+            free(buf);
+            LeaveCriticalSection(&gCtxLock);
+            return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
+                                        MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
+        }
+        WwSboxDecrypt(&ctx->sbox, buf, (size_t)logical_size, 0);
+    }
+    WwEngLog(2, "ntsection: h=%p logical=%lld (mapped read)", FileHandle, logical_size);
+    LeaveCriticalSection(&gCtxLock);
+    /* Anonymous section holding the plaintext. PAGE_READWRITE so we
+     * can copy the data in; the caller may map it read-only. */
+    maxsz.QuadPart = logical_size > 0 ? logical_size : 1;
+    st = gOrigNtCreateSection(&anon, DesiredAccess, ObjectAttributes, &maxsz,
+                              0x04 /* PAGE_READWRITE */, 0x08000000 /* SEC_COMMIT */, NULL);
+    if (!WW_NT_SUCCESS(st) || !anon) {
+        free(buf);
+        return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
+                                    MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
+    }
+    if (logical_size > 0) {
+        viewsz = (SIZE_T)logical_size;
+        secoff.QuadPart = 0;
+        st = gOrigNtMapViewOfSection(anon, (HANDLE)(LONG_PTR)-1 /* NtCurrentProcess */,
+                                     &base, 0, 0, &secoff, &viewsz, 1 /* ViewShare */, 0, 0x04 /* PAGE_READWRITE */);
+        if (!WW_NT_SUCCESS(st) || !base) {
+            gOrigNtClose(anon);
+            free(buf);
+            return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
+                                        MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
+        }
+        memcpy(base, buf, (size_t)logical_size);
+        gOrigNtUnmapViewOfSection((HANDLE)(LONG_PTR)-1, base);
+    }
+    free(buf);
+    *SectionHandle = anon;
+    return 0; /* STATUS_SUCCESS */
+}
+
 static NTSTATUS NTAPI WwHookNtSetInformationFile(HANDLE FileHandle,
     PWW_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
     WW_FILE_INFORMATION_CLASS FileInformationClass)
@@ -1241,7 +1359,7 @@ static int WwDetoursInstall(void)
      * DllMain so a failed Attach is visible instead of hidden in a
      * total. Order: NtCreateFile, NtOpenFile, NtReadFile, NtWriteFile,
      * NtClose, NtSetInformationFile, NtQueryInformationFile. */
-    static char gAttachStatus[8] = "???????";
+    static char gAttachStatus[9] = "????????";
 
     /* Win32 originals are resolved for INTERNAL use only
      * (WwEngOnCreate reads/writes the header and queries the size
@@ -1278,6 +1396,9 @@ static int WwDetoursInstall(void)
         if (!gOrigNtClose) gOrigNtClose = (NtClose_t)GetProcAddress(ntdll, "NtClose");
         if (!gOrigNtSetInformationFile) gOrigNtSetInformationFile = (NtSetInformationFile_t)GetProcAddress(ntdll, "NtSetInformationFile");
         if (!gOrigNtQueryInformationFile) gOrigNtQueryInformationFile = (NtQueryInformationFile_t)GetProcAddress(ntdll, "NtQueryInformationFile");
+        if (!gOrigNtCreateSection) gOrigNtCreateSection = (NtCreateSection_t)GetProcAddress(ntdll, "NtCreateSection");
+        if (!gOrigNtMapViewOfSection) gOrigNtMapViewOfSection = (NtMapViewOfSection_t)GetProcAddress(ntdll, "NtMapViewOfSection");
+        if (!gOrigNtUnmapViewOfSection) gOrigNtUnmapViewOfSection = (NtUnmapViewOfSection_t)GetProcAddress(ntdll, "NtUnmapViewOfSection");
     }
 
     err = DetourTransactionBegin();
@@ -1290,6 +1411,7 @@ static int WwDetoursInstall(void)
     WW_ATTACH(&gOrigNtClose, WwHookNtClose, "NtClose", gAttachStatus, 4);
     WW_ATTACH(&gOrigNtSetInformationFile, WwHookNtSetInformationFile, "NtSetInformationFile", gAttachStatus, 5);
     WW_ATTACH(&gOrigNtQueryInformationFile, WwHookNtQueryInformationFile, "NtQueryInformationFile", gAttachStatus, 6);
+    WW_ATTACH(&gOrigNtCreateSection, WwHookNtCreateSection, "NtCreateSection", gAttachStatus, 7);
     err = DetourTransactionCommit();
     if (err != NO_ERROR) {
         DetourTransactionAbort();
@@ -1297,16 +1419,16 @@ static int WwDetoursInstall(void)
     }
     {
         int i;
-        for (i = 0; i < 7; i++) if (gAttachStatus[i] == '1') n++;
+        for (i = 0; i < 8; i++) if (gAttachStatus[i] == '1') n++;
     }
     /* Keep the status string visible to DllMain's attach log. */
     {
-        extern char gWwAttachStatus[8];
-        memcpy(gWwAttachStatus, gAttachStatus, 8);
+        extern char gWwAttachStatus[9];
+        memcpy(gWwAttachStatus, gAttachStatus, 9);
     }
     return n;
 }
-char gWwAttachStatus[8] = "???????";
+char gWwAttachStatus[9] = "????????";
 
 /* ---- DllMain ---- */
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
@@ -1327,7 +1449,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         {
             WCHAR exeName[MAX_PATH];
             int attached;
-            extern char gWwAttachStatus[8];
+            extern char gWwAttachStatus[9];
             GetOwnExeName(exeName, MAX_PATH);
             attached = WwDetoursInstall();
             /* Per-hook status (1=ok, 0=fail), order: NtCreateFile,
