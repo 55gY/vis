@@ -101,6 +101,16 @@ typedef NTSTATUS (NTAPI *NtQueryInformationFile_t)(HANDLE, PWW_IO_STATUS_BLOCK, 
 typedef NTSTATUS (NTAPI *NtCreateSection_t)(PHANDLE, ACCESS_MASK, PWW_OBJECT_ATTRIBUTES, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
 typedef NTSTATUS (NTAPI *NtMapViewOfSection_t)(HANDLE, HANDLE, PVOID *, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, ULONG);
 typedef NTSTATUS (NTAPI *NtUnmapViewOfSection_t)(HANDLE, PVOID);
+/* Faithful copy of the vendor's hook table (FUN_180034db0):
+ * NtDuplicateObject copies the file context to the new handle;
+ * NtCopyFileChunk translates both offsets +512; NtWriteFileGather
+ * is the scatter version of the write hook. */
+typedef NTSTATUS (NTAPI *NtDuplicateObject_t)(HANDLE, HANDLE, HANDLE, PHANDLE, ACCESS_MASK, ULONG, ULONG);
+typedef NTSTATUS (NTAPI *NtCopyFileChunk_t)(HANDLE, HANDLE, HANDLE, PVOID, PVOID, ULONG, PLARGE_INTEGER, PLARGE_INTEGER, PULONG);
+typedef struct _WW_FILE_SEGMENT_ELEMENT {
+    PVOID Buffer;
+} WW_FILE_SEGMENT_ELEMENT, *PWW_FILE_SEGMENT_ELEMENT;
+typedef NTSTATUS (NTAPI *NtWriteFileGather_t)(HANDLE, HANDLE, PVOID, PVOID, PWW_IO_STATUS_BLOCK, PWW_FILE_SEGMENT_ELEMENT, ULONG, PLARGE_INTEGER, PULONG);
 
 static NtCreateFile_t gOrigNtCreateFile = NULL;
 static NtOpenFile_t gOrigNtOpenFile = NULL;
@@ -112,6 +122,9 @@ static NtQueryInformationFile_t gOrigNtQueryInformationFile = NULL;
 static NtCreateSection_t gOrigNtCreateSection = NULL;
 static NtMapViewOfSection_t gOrigNtMapViewOfSection = NULL;
 static NtUnmapViewOfSection_t gOrigNtUnmapViewOfSection = NULL;
+static NtDuplicateObject_t gOrigNtDuplicateObject = NULL;
+static NtCopyFileChunk_t gOrigNtCopyFileChunk = NULL;
+static NtWriteFileGather_t gOrigNtWriteFileGather = NULL;
 
 /* Convert an NT path (\??\C:\... or \DosDevices\C:\...) to a Win32
  * path (C:\...). Returns FALSE if it is not a Win32-style path. */
@@ -1234,6 +1247,225 @@ static NTSTATUS NTAPI WwHookNtClose(HANDLE Handle)
     return gOrigNtClose(Handle);
 }
 
+/* ---- NtDuplicateObject (vendor FUN_18002d7d0) ----
+ * When a handle is duplicated, the new handle gets a full copy of
+ * the source handle's file context (same sbox/key/mode). Without
+ * this, a duplicated handle has no context and its reads/writes
+ * bypass the encryption (or get mis-translated). */
+static NTSTATUS NTAPI WwHookNtDuplicateObject(HANDLE SourceProcessHandle,
+    HANDLE SourceHandle, HANDLE TargetProcessHandle, PHANDLE TargetHandle,
+    ACCESS_MASK DesiredAccess, ULONG Attributes, ULONG Options)
+{
+    NTSTATUS st;
+    WW_FILE_CTX *src = NULL;
+    WW_FILE_CTX saved;
+    BOOL have_src = FALSE;
+
+    EnterCriticalSection(&gCtxLock);
+    src = WwEngFindCtx(SourceHandle);
+    if (src && src->is_encrypted) {
+        saved = *src;  /* copy the whole context (sbox/key/mode) */
+        have_src = TRUE;
+    }
+    LeaveCriticalSection(&gCtxLock);
+
+    st = gOrigNtDuplicateObject(SourceProcessHandle, SourceHandle,
+                                TargetProcessHandle, TargetHandle,
+                                DesiredAccess, Attributes, Options);
+    if (!WW_NT_SUCCESS(st) || !TargetHandle || !*TargetHandle) return st;
+    if (!have_src) return st;
+    /* Only duplicate within the same process (cross-process handles
+     * belong to another process's table and we cannot track them). */
+    if (TargetProcessHandle != (HANDLE)(LONG_PTR)-1 &&
+        TargetProcessHandle != GetCurrentProcess()) {
+        return st;
+    }
+    EnterCriticalSection(&gCtxLock);
+    {
+        WW_FILE_CTX *nctx = (WW_FILE_CTX *)calloc(1, sizeof(WW_FILE_CTX));
+        if (nctx) {
+            *nctx = saved;
+            nctx->hFile = *TargetHandle;
+            nctx->next = NULL;
+            WwEngInsertCtx(nctx);
+            WwEngLog(2, "ntdup: h=%p -> h=%p", SourceHandle, *TargetHandle);
+        }
+    }
+    LeaveCriticalSection(&gCtxLock);
+    return st;
+}
+
+/* ---- NtCopyFileChunk (vendor FUN_180033410) ----
+ * Server-side copy: both the source and the destination offsets
+ * are logical, so both are translated +512. If the copy covers
+ * the whole file (both offsets 0) the destination inherits the
+ * source's context (same key), so a copied file stays encrypted
+ * and readable. */
+static NTSTATUS NTAPI WwHookNtCopyFileChunk(HANDLE SourceHandle,
+    HANDLE DestHandle, HANDLE Event, PVOID ApcRoutine, PVOID ApcContext,
+    ULONG Length, PLARGE_INTEGER SourceOffset, PLARGE_INTEGER DestOffset,
+    PULONG Key)
+{
+    NTSTATUS st;
+    WW_FILE_CTX *src = NULL;
+    WW_FILE_CTX *dst = NULL;
+    LARGE_INTEGER saved_src, saved_dst;
+    BOOL have_src_off = FALSE, have_dst_off = FALSE;
+
+    EnterCriticalSection(&gCtxLock);
+    src = WwEngFindCtx(SourceHandle);
+    dst = WwEngFindCtx(DestHandle);
+    if (src && src->is_encrypted && SourceOffset) {
+        saved_src.QuadPart = SourceOffset->QuadPart;
+        SourceOffset->QuadPart = saved_src.QuadPart + WWFLT_HEADER_SIZE;
+        have_src_off = TRUE;
+    }
+    if (dst && dst->is_encrypted && DestOffset) {
+        saved_dst.QuadPart = DestOffset->QuadPart;
+        DestOffset->QuadPart = saved_dst.QuadPart + WWFLT_HEADER_SIZE;
+        have_dst_off = TRUE;
+    }
+    LeaveCriticalSection(&gCtxLock);
+
+    st = gOrigNtCopyFileChunk(SourceHandle, DestHandle, Event, ApcRoutine,
+                              ApcContext, Length, SourceOffset, DestOffset, Key);
+
+    if (have_src_off) SourceOffset->QuadPart = saved_src.QuadPart;
+    if (have_dst_off) DestOffset->QuadPart = saved_dst.QuadPart;
+
+    /* Whole-file copy (both offsets 0): sync the destination's
+     * context with the source's, like the vendor does. */
+    if (WW_NT_SUCCESS(st) && src && src->is_encrypted &&
+        (!SourceOffset || SourceOffset->QuadPart == 0) &&
+        (!DestOffset || DestOffset->QuadPart == 0)) {
+        EnterCriticalSection(&gCtxLock);
+        if (!WwEngFindCtx(DestHandle)) {
+            WW_FILE_CTX *nctx = (WW_FILE_CTX *)calloc(1, sizeof(WW_FILE_CTX));
+            if (nctx) {
+                *nctx = *src;
+                nctx->hFile = DestHandle;
+                nctx->next = NULL;
+                WwEngInsertCtx(nctx);
+            }
+        }
+        LeaveCriticalSection(&gCtxLock);
+    }
+    return st;
+}
+
+/* ---- NtWriteFileGather (vendor FUN_18002a1c0) ----
+ * The scatter version of the write hook: same offset translation
+ * (+512) and encryption, applied per segment. Each segment is a
+ * page (4096 bytes) except possibly the last. The data is
+ * encrypted into temp buffers (never in place, so the caller's
+ * buffers are untouched), exactly like the vendor encrypts into
+ * its own pool buffers. */
+static NTSTATUS NTAPI WwHookNtWriteFileGather(HANDLE FileHandle,
+    HANDLE Event, PVOID ApcRoutine, PVOID ApcContext,
+    PWW_IO_STATUS_BLOCK IoStatusBlock, PWW_FILE_SEGMENT_ELEMENT SegmentArray,
+    ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key)
+{
+    WW_FILE_CTX *ctx;
+    NTSTATUS st;
+    LONGLONG logical_off;
+    BOOL use_explicit_off = FALSE;
+    LARGE_INTEGER saved_off;
+    ULONG nseg, i;
+    PWW_FILE_SEGMENT_ELEMENT tmp_segs = NULL;
+    unsigned char **tmp_bufs = NULL;
+
+    EnterCriticalSection(&gCtxLock);
+    ctx = WwEngFindCtx(FileHandle);
+    if (!ctx || !ctx->is_encrypted || ctx->mode != WWFLT_ENCRYPT_WRITE) {
+        LeaveCriticalSection(&gCtxLock);
+        return gOrigNtWriteFileGather(FileHandle, Event, ApcRoutine, ApcContext,
+                                      IoStatusBlock, SegmentArray, Length,
+                                      ByteOffset, Key);
+    }
+    if (ByteOffset) {
+        logical_off = ByteOffset->QuadPart;
+        if (logical_off < 0) {
+            LeaveCriticalSection(&gCtxLock);
+            return gOrigNtWriteFileGather(FileHandle, Event, ApcRoutine, ApcContext,
+                                          IoStatusBlock, SegmentArray, Length,
+                                          ByteOffset, Key);
+        }
+        use_explicit_off = TRUE;
+        saved_off.QuadPart = logical_off;
+        ByteOffset->QuadPart = logical_off + WWFLT_HEADER_SIZE;
+    } else {
+        if (!NtGetPosition(FileHandle, &logical_off) || logical_off < 0) {
+            LeaveCriticalSection(&gCtxLock);
+            return gOrigNtWriteFileGather(FileHandle, Event, ApcRoutine, ApcContext,
+                                          IoStatusBlock, SegmentArray, Length,
+                                          ByteOffset, Key);
+        }
+        saved_off.QuadPart = logical_off;
+        {
+            LARGE_INTEGER phys;
+            phys.QuadPart = logical_off + WWFLT_HEADER_SIZE;
+            if (!NtSetPosition(FileHandle, &phys)) {
+                LeaveCriticalSection(&gCtxLock);
+                return gOrigNtWriteFileGather(FileHandle, Event, ApcRoutine, ApcContext,
+                                              IoStatusBlock, SegmentArray, Length,
+                                              ByteOffset, Key);
+            }
+        }
+    }
+    nseg = (Length + 4095) / 4096;
+    tmp_segs = (PWW_FILE_SEGMENT_ELEMENT)malloc(nseg * sizeof(WW_FILE_SEGMENT_ELEMENT));
+    tmp_bufs = (unsigned char **)malloc(nseg * sizeof(unsigned char *));
+    if (!tmp_segs || !tmp_bufs) {
+        free(tmp_segs);
+        free(tmp_bufs);
+        if (use_explicit_off) ByteOffset->QuadPart = saved_off.QuadPart;
+        else NtSetPosition(FileHandle, &saved_off);
+        LeaveCriticalSection(&gCtxLock);
+        if (IoStatusBlock) { IoStatusBlock->Status = 0xC0000017; IoStatusBlock->Information = 0; }
+        return 0xC0000017;
+    }
+    for (i = 0; i < nseg; i++) tmp_bufs[i] = NULL;
+    for (i = 0; i < nseg; i++) {
+        ULONG seglen = Length - i * 4096;
+        if (seglen > 4096) seglen = 4096;
+        tmp_bufs[i] = (unsigned char *)malloc(seglen ? seglen : 1);
+        if (!tmp_bufs[i]) break;
+        memcpy(tmp_bufs[i], SegmentArray[i].Buffer, seglen);
+        WwSboxEncrypt(&ctx->sbox, tmp_bufs[i], seglen,
+                      (ULONGLONG)(logical_off + (LONGLONG)i * 4096));
+        tmp_segs[i].Buffer = tmp_bufs[i];
+    }
+    if (i != nseg) {
+        ULONG j;
+        for (j = 0; j < i; j++) free(tmp_bufs[j]);
+        free(tmp_bufs);
+        free(tmp_segs);
+        if (use_explicit_off) ByteOffset->QuadPart = saved_off.QuadPart;
+        else NtSetPosition(FileHandle, &saved_off);
+        LeaveCriticalSection(&gCtxLock);
+        if (IoStatusBlock) { IoStatusBlock->Status = 0xC0000017; IoStatusBlock->Information = 0; }
+        return 0xC0000017;
+    }
+    WwEngLog(2, "ntwritegather: h=%p logical=%lld len=%lu expl=%d", FileHandle, logical_off, Length, use_explicit_off ? 1 : 0);
+    st = gOrigNtWriteFileGather(FileHandle, Event, ApcRoutine, ApcContext,
+                                IoStatusBlock, tmp_segs, Length, ByteOffset, Key);
+    {
+        ULONG j;
+        for (j = 0; j < nseg; j++) free(tmp_bufs[j]);
+        free(tmp_bufs);
+        free(tmp_segs);
+    }
+    if (use_explicit_off) {
+        ByteOffset->QuadPart = saved_off.QuadPart;
+    } else if (WW_NT_SUCCESS(st) && IoStatusBlock) {
+        LARGE_INTEGER cur;
+        cur.QuadPart = saved_off.QuadPart + (LONGLONG)IoStatusBlock->Information;
+        NtSetPosition(FileHandle, &cur);
+    }
+    LeaveCriticalSection(&gCtxLock);
+    return st;
+}
+
 /* ---- Memory-mapped reads ----
  * A reader that maps the file (Notepad does this) never calls
  * NtReadFile, so the read hook never sees the content. The vendor
@@ -1456,15 +1688,18 @@ static NTSTATUS NTAPI WwHookNtQueryInformationFile(HANDLE FileHandle,
     /* Report the LOGICAL size (physical - 512) so callers see the
      * plaintext length. The file position is already logical (the
      * raw position is maintained in the logical view), so it is
-     * reported as-is. */
+     * reported as-is.
+     * Faithful copy of the vendor's FUN_18002bdb0: for
+     * FileStandardInformation only the EndOfFile is adjusted
+     * (-512); the AllocationSize is left as the physical value.
+     * (An earlier version subtracted 512 from both; the vendor
+     * does not touch AllocationSize here.) */
     if (FileInformationClass == WW_FileStandardInformation && Length >= sizeof(WW_FILE_STANDARD_INFORMATION)) {
         WW_FILE_STANDARD_INFORMATION *si = (WW_FILE_STANDARD_INFORMATION *)FileInformation;
         if (si->EndOfFile.QuadPart >= WWFLT_HEADER_SIZE)
             si->EndOfFile.QuadPart -= WWFLT_HEADER_SIZE;
         else
             si->EndOfFile.QuadPart = 0;
-        if (si->AllocationSize.QuadPart >= WWFLT_HEADER_SIZE)
-            si->AllocationSize.QuadPart -= WWFLT_HEADER_SIZE;
     } else if (FileInformationClass == WW_FileEndOfFileInformation && Length >= sizeof(WW_FILE_END_OF_FILE_INFORMATION)) {
         WW_FILE_END_OF_FILE_INFORMATION *ei = (WW_FILE_END_OF_FILE_INFORMATION *)FileInformation;
         if (ei->EndOfFile.QuadPart >= WWFLT_HEADER_SIZE)
@@ -1512,8 +1747,10 @@ static int WwDetoursInstall(void)
     /* Per-hook status, one char per hook in attach order; logged in
      * DllMain so a failed Attach is visible instead of hidden in a
      * total. Order: NtCreateFile, NtOpenFile, NtReadFile, NtWriteFile,
-     * NtClose, NtSetInformationFile, NtQueryInformationFile. */
-    static char gAttachStatus[9] = "????????";
+     * NtClose, NtSetInformationFile, NtQueryInformationFile,
+     * NtCreateSection, NtDuplicateObject, NtCopyFileChunk,
+     * NtWriteFileGather. */
+    static char gAttachStatus[12] = "???????????";
 
     /* Win32 originals are resolved for INTERNAL use only
      * (WwEngOnCreate reads/writes the header and queries the size
@@ -1553,6 +1790,9 @@ static int WwDetoursInstall(void)
         if (!gOrigNtCreateSection) gOrigNtCreateSection = (NtCreateSection_t)GetProcAddress(ntdll, "NtCreateSection");
         if (!gOrigNtMapViewOfSection) gOrigNtMapViewOfSection = (NtMapViewOfSection_t)GetProcAddress(ntdll, "NtMapViewOfSection");
         if (!gOrigNtUnmapViewOfSection) gOrigNtUnmapViewOfSection = (NtUnmapViewOfSection_t)GetProcAddress(ntdll, "NtUnmapViewOfSection");
+        if (!gOrigNtDuplicateObject) gOrigNtDuplicateObject = (NtDuplicateObject_t)GetProcAddress(ntdll, "NtDuplicateObject");
+        if (!gOrigNtCopyFileChunk) gOrigNtCopyFileChunk = (NtCopyFileChunk_t)GetProcAddress(ntdll, "NtCopyFileChunk");
+        if (!gOrigNtWriteFileGather) gOrigNtWriteFileGather = (NtWriteFileGather_t)GetProcAddress(ntdll, "NtWriteFileGather");
     }
 
     err = DetourTransactionBegin();
@@ -1566,6 +1806,9 @@ static int WwDetoursInstall(void)
     WW_ATTACH(&gOrigNtSetInformationFile, WwHookNtSetInformationFile, "NtSetInformationFile", gAttachStatus, 5);
     WW_ATTACH(&gOrigNtQueryInformationFile, WwHookNtQueryInformationFile, "NtQueryInformationFile", gAttachStatus, 6);
     WW_ATTACH(&gOrigNtCreateSection, WwHookNtCreateSection, "NtCreateSection", gAttachStatus, 7);
+    WW_ATTACH(&gOrigNtDuplicateObject, WwHookNtDuplicateObject, "NtDuplicateObject", gAttachStatus, 8);
+    WW_ATTACH(&gOrigNtCopyFileChunk, WwHookNtCopyFileChunk, "NtCopyFileChunk", gAttachStatus, 9);
+    WW_ATTACH(&gOrigNtWriteFileGather, WwHookNtWriteFileGather, "NtWriteFileGather", gAttachStatus, 10);
     err = DetourTransactionCommit();
     if (err != NO_ERROR) {
         DetourTransactionAbort();
@@ -1573,16 +1816,16 @@ static int WwDetoursInstall(void)
     }
     {
         int i;
-        for (i = 0; i < 8; i++) if (gAttachStatus[i] == '1') n++;
+        for (i = 0; i < 11; i++) if (gAttachStatus[i] == '1') n++;
     }
     /* Keep the status string visible to DllMain's attach log. */
     {
-        extern char gWwAttachStatus[9];
-        memcpy(gWwAttachStatus, gAttachStatus, 9);
+        extern char gWwAttachStatus[12];
+        memcpy(gWwAttachStatus, gAttachStatus, 12);
     }
     return n;
 }
-char gWwAttachStatus[9] = "????????";
+char gWwAttachStatus[12] = "???????????";
 
 /* ---- DllMain ---- */
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
@@ -1603,7 +1846,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         {
             WCHAR exeName[MAX_PATH];
             int attached;
-            extern char gWwAttachStatus[9];
+            extern char gWwAttachStatus[12];
             GetOwnExeName(exeName, MAX_PATH);
             attached = WwDetoursInstall();
             /* Per-hook status (1=ok, 0=fail), order: NtCreateFile,
