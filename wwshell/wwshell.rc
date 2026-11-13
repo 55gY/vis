@@ -1,0 +1,5 @@
+#include <windows.h>
+
+/* Lock overlay icon (user-supplied Project1.ico). Single icon group,
+ * ID 1; GetOverlayInfo returns index 0. */
+1 ICON "lock.ico"

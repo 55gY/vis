@@ -16,6 +16,7 @@ on:
       - "wwinj/**"
       - "wweng/**"
       - "wwsvc/**"
+      - "wwshell/**"
       - ".github/workflows/build-driver.yml"
   pull_request:
     branches: ["main"]
@@ -24,6 +25,7 @@ on:
       - "wwinj/**"
       - "wweng/**"
       - "wwsvc/**"
+      - "wwshell/**"
   workflow_dispatch:
 
 permissions:
@@ -193,6 +195,18 @@ jobs:
           ls -l wweng64.dll
           md5sum wweng64.dll
 
+      - name: Build wwshell (x64 + x86)
+        run: |
+          cd wwshell
+          zig cc -target x86_64-windows-gnu -O2 -shared -D_WIN32_WINNT=0x0601 \
+            -o wwshell64.dll wwshell.c ../wweng/sbox.c wwshell.rc wwshell.def \
+            -lshell32 -lole32 -luser32 -ladvapi32
+          zig cc -target x86-windows-gnu -O2 -shared -D_WIN32_WINNT=0x0601 \
+            -o wwshell.dll wwshell.c ../wweng/sbox.c wwshell.rc wwshell.def \
+            -lshell32 -lole32 -luser32 -ladvapi32
+          ls -l wwshell64.dll wwshell.dll
+          md5sum wwshell64.dll wwshell.dll
+
       - name: Upload service artifact
         uses: actions/upload-artifact@v4
         with:
@@ -202,3 +216,5 @@ jobs:
           path: |
             wwsvc/wwsvc.exe
             wweng/wweng64.dll
+            wwshell/wwshell64.dll
+            wwshell/wwshell.dll
