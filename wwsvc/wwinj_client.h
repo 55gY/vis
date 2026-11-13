@@ -1,7 +1,9 @@
 /* wwinj_client.h -- user-mode client for the WWInject driver control
  * device (\\.\WWInject). The service uses this to start the driver,
- * configure the engine DLL path (+ LoadLibraryW address) and the
- * target exe list, request on-demand injection by PID, and read status.
+ * configure the engine DLL path (+ LoadLibraryW address), request
+ * on-demand injection by PID, and read status. The driver is a pure
+ * injector: it injects into every new process and knows nothing about
+ * policy, so there is no target-list API.
  */
 #pragma once
 #include <windows.h>
@@ -19,9 +21,6 @@ HANDLE wwinj_open(void);
 
 /* Set the engine DLL path + LoadLibraryW address. Returns 0 on success. */
 DWORD wwinj_set_dll_path(HANDLE h, const WCHAR *dll_path, ULONGLONG load_library_w);
-
-/* Set the target exe list. Returns 0 on success. */
-DWORD wwinj_set_targets(HANDLE h, const WWINJ_TARGETS *targets);
 
 /* Request an on-demand injection into `pid`. Returns 0 on success;
  * *status_out gets the driver's NTSTATUS for the attempt. */

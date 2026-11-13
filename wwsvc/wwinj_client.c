@@ -79,15 +79,6 @@ DWORD wwinj_set_dll_path(HANDLE h, const WCHAR *dll_path, ULONGLONG load_library
     return 0;
 }
 
-DWORD wwinj_set_targets(HANDLE h, const WWINJ_TARGETS *targets)
-{
-    DWORD ret = 0;
-    if (!DeviceIoControl(h, IOCTL_WWINJ_SET_TARGETS, (LPVOID)targets, (DWORD)sizeof(*targets),
-                         NULL, 0, &ret, NULL))
-        return GetLastError();
-    return 0;
-}
-
 DWORD wwinj_inject_pid(HANDLE h, ULONG pid, LONG *status_out)
 {
     WWINJ_INJECT req;

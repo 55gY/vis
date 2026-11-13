@@ -5,9 +5,11 @@
  * Control device: \\Device\\WWInject, symbolic link \\DosDevices\\WWInject.
  * All IOCTLs use METHOD_BUFFERED.
  *
- * The driver watches for new processes whose image name is in the
- * target list and injects wweng64.dll into them by queueing a
- * user-mode APC (LoadLibraryW) to the process's first thread.
+ * The driver is a pure injector: it injects wweng64.dll into EVERY new
+ * process by queueing a user-mode APC (LoadLibraryW) to the process's
+ * first thread. It does NOT know or care about policy -- no target
+ * list, no .xcf, no group. The engine DLL decides per-process and
+ * per-file whether to encrypt/decrypt (it reads wwkrn.xcf itself).
  * The service can also ask for an on-demand injection by PID.
  */
 #pragma once
@@ -17,15 +19,12 @@
 #define WWINJ_WIN32_DEVICE     "\\\\.\\WWInject"
 
 #define WWINJ_MAX_DLL_PATH     260
-#define WWINJ_MAX_TARGETS      32
-#define WWINJ_MAX_EXE_LEN      64
 
 /* ---- IOCTL codes ---- */
 #define WWINJ_IOCTL_BASE       0x800
 #define IOCTL_WWINJ_SET_DLL_PATH CTL_CODE(FILE_DEVICE_UNKNOWN, WWINJ_IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_WWINJ_SET_TARGETS  CTL_CODE(FILE_DEVICE_UNKNOWN, WWINJ_IOCTL_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_WWINJ_INJECT_PID   CTL_CODE(FILE_DEVICE_UNKNOWN, WWINJ_IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_WWINJ_GET_STATUS   CTL_CODE(FILE_DEVICE_UNKNOWN, WWINJ_IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WWINJ_INJECT_PID   CTL_CODE(FILE_DEVICE_UNKNOWN, WWINJ_IOCTL_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WWINJ_GET_STATUS   CTL_CODE(FILE_DEVICE_UNKNOWN, WWINJ_IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* SET_DLL_PATH input: WWINJ_DLL_PATH (WCHAR path + LoadLibraryW address).
  * The LoadLibraryW address is taken from the service process; kernel32.dll
@@ -35,12 +34,6 @@ typedef struct _WWINJ_DLL_PATH {
     WCHAR path[WWINJ_MAX_DLL_PATH];
     ULONGLONG load_library_w;   /* address of LoadLibraryW in kernel32.dll */
 } WWINJ_DLL_PATH, *PWWINJ_DLL_PATH;
-
-/* SET_TARGETS input: WWINJ_TARGETS (count + exe names, lowercase compare). */
-typedef struct _WWINJ_TARGETS {
-    ULONG count;
-    WCHAR exe[WWINJ_MAX_TARGETS][WWINJ_MAX_EXE_LEN];
-} WWINJ_TARGETS, *PWWINJ_TARGETS;
 
 /* INJECT_PID input/output: WWINJ_INJECT (pid in, NTSTATUS out). */
 typedef struct _WWINJ_INJECT {
@@ -52,7 +45,6 @@ typedef struct _WWINJ_INJECT {
 typedef struct _WWINJ_STATUS {
     ULONG driver_version;
     ULONG dll_path_set;         /* 1 if a DLL path has been configured */
-    ULONG target_count;
     ULONGLONG processes_seen;   /* create-process notifications */
     ULONGLONG injections_queued;
     ULONGLONG injections_failed;

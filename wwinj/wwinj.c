@@ -58,8 +58,6 @@ BOOLEAN KeInsertQueueApc(struct _KAPC *Apc, PVOID SystemArgument1, PVOID SystemA
 static PDEVICE_OBJECT gDevice = NULL;
 static WCHAR gDllPath[WWINJ_MAX_DLL_PATH] = { 0 };
 static PVOID gLoadLibraryW = NULL;
-static WCHAR gTargets[WWINJ_MAX_TARGETS][WWINJ_MAX_EXE_LEN];
-static ULONG gTargetCount = 0;
 static KSPIN_LOCK gCfgLock;
 static ULONGLONG gProcessesSeen = 0;
 static ULONGLONG gInjectionsQueued = 0;
@@ -92,40 +90,6 @@ static void WwInjMarkInjected(HANDLE pid)
         gInjectedPids[gInjectedCount++] = pid;
     }
     KeReleaseSpinLock(&gInjectedLock, irql);
-}
-
-static WCHAR WwInjToLower(WCHAR c)
-{
-    if (c >= L'A' && c <= L'Z') return (WCHAR)(c + (L'a' - L'A'));
-    return c;
-}
-
-static int WwInjWcsIcmp(PCWSTR a, PCWSTR b)
-{
-    while (*a && *b) {
-        WCHAR ca = WwInjToLower(*a), cb = WwInjToLower(*b);
-        if (ca != cb) return (int)ca - (int)cb;
-        a++; b++;
-    }
-    return (int)WwInjToLower(*a) - (int)WwInjToLower(*b);
-}
-
-static BOOLEAN WwInjIsTarget(PCWSTR imageName)
-{
-    KIRQL irql;
-    ULONG i;
-    BOOLEAN found = FALSE;
-    PCWSTR slash;
-    PCWSTR base;
-    if (!imageName) return FALSE;
-    slash = wcsrchr(imageName, L'\\');
-    base = slash ? slash + 1 : imageName;
-    KeAcquireSpinLock(&gCfgLock, &irql);
-    for (i = 0; i < gTargetCount; i++) {
-        if (WwInjWcsIcmp(gTargets[i], base) == 0) { found = TRUE; break; }
-    }
-    KeReleaseSpinLock(&gCfgLock, irql);
-    return found;
 }
 
 /* ---- APC injection ---- */
@@ -385,43 +349,31 @@ static VOID WwInjCreateThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN C
     PEPROCESS process = NULL;
     PETHREAD thread = NULL;
     NTSTATUS st;
-    PUNICODE_STRING image = NULL;
     KIRQL irql;
     if (!Create) return;
-    /* Skip everything until the service has configured a DLL path and
-     * at least one target; otherwise every thread creation in the
-     * system pays for a lookup and an injection attempt. */
+    /* The driver is a pure injector: it does NOT know about policy
+     * and does NOT filter by image name. Every new process gets the
+     * engine DLL; the DLL itself decides (from wwkrn.xcf) whether
+     * this process may read/write encrypted files. So the only
+     * gates here are: DLL path configured, and not already injected.
+     * No SeLocateProcessImageName, no target list. */
     KeAcquireSpinLock(&gCfgLock, &irql);
     {
-        BOOLEAN configured = (gDllPath[0] != 0) && (gLoadLibraryW != NULL) && (gTargetCount > 0);
+        BOOLEAN configured = (gDllPath[0] != 0) && (gLoadLibraryW != NULL);
         KeReleaseSpinLock(&gCfgLock, irql);
         if (!configured) return;
     }
     if (WwInjAlreadyInjected(ProcessId)) return;
     st = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(st)) return;
-    st = SeLocateProcessImageName(process, &image);
-    if (!NT_SUCCESS(st) || !image || !image->Buffer) {
-        if (image) ExFreePool(image);
-        ObDereferenceObject(process);
-        return;
-    }
-    if (!WwInjIsTarget(image->Buffer)) {
-        ExFreePool(image);
-        ObDereferenceObject(process);
-        return;
-    }
-    ExFreePool(image);
-    /* Inject via this thread. Mark first so a second thread notify
-     * for the same process does not queue a duplicate APC. */
+    /* Inject via the thread being created. Mark first so a second
+     * thread notify for the same process does not queue a duplicate
+     * APC. Uses the notify's own ThreadId (PsLookupThreadByThreadId);
+     * never enumerates all processes with ZwQuerySystemInformation
+     * here (heavy, takes the process-list lock while a thread is
+     * being created). The ZwQuerySystemInformation lookup stays only
+     * in the IOCTL INJECT_PID path for already-running processes. */
     WwInjMarkInjected(ProcessId);
-    /* Use the thread being created directly (PsLookupThreadByThreadId
-     * on the notify's ThreadId). Do NOT enumerate all processes with
-     * ZwQuerySystemInformation here: it is heavy, takes the process
-     * list lock while a thread is being created, and can hand back a
-     * thread that is not fully initialised -- that is the 0x3B crash
-     * path. The ZwQuerySystemInformation lookup stays only in the
-     * IOCTL INJECT_PID path for already-running processes. */
     st = PsLookupThreadByThreadId(ThreadId, &thread);
     if (!NT_SUCCESS(st)) {
         InterlockedIncrement64((volatile LONGLONG *)&gInjectionsFailed);
@@ -468,22 +420,6 @@ static NTSTATUS WwInjDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         Irp->IoStatus.Information = 0;
         break;
     }
-    case IOCTL_WWINJ_SET_TARGETS: {
-        PWWINJ_TARGETS t = (PWWINJ_TARGETS)inBuf;
-        KIRQL irql;
-        ULONG i;
-        if (inLen < sizeof(ULONG) || inLen < sizeof(WWINJ_TARGETS)) { st = STATUS_BUFFER_TOO_SMALL; break; }
-        if (t->count > WWINJ_MAX_TARGETS) { st = STATUS_INVALID_PARAMETER; break; }
-        KeAcquireSpinLock(&gCfgLock, &irql);
-        gTargetCount = t->count;
-        for (i = 0; i < t->count; i++) {
-            wcsncpy(gTargets[i], t->exe[i], WWINJ_MAX_EXE_LEN - 1);
-            gTargets[i][WWINJ_MAX_EXE_LEN - 1] = L'\0';
-        }
-        KeReleaseSpinLock(&gCfgLock, irql);
-        Irp->IoStatus.Information = 0;
-        break;
-    }
     case IOCTL_WWINJ_INJECT_PID: {
         PWWINJ_INJECT req = (PWWINJ_INJECT)inBuf;
         PEPROCESS process = NULL;
@@ -516,7 +452,6 @@ static NTSTATUS WwInjDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         s->driver_version = WWINJ_DRIVER_VERSION;
         KeAcquireSpinLock(&gCfgLock, &irql);
         s->dll_path_set = gDllPath[0] ? 1 : 0;
-        s->target_count = gTargetCount;
         KeReleaseSpinLock(&gCfgLock, irql);
         s->processes_seen = gProcessesSeen;
         s->injections_queued = gInjectionsQueued;
