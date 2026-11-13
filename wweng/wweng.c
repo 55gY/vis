@@ -1391,19 +1391,30 @@ static NTSTATUS NTAPI WwHookNtSetInformationFile(HANDLE FileHandle,
     /* Diagnostic: log every size-changing SetInformationFile call
      * (EndOfFile=20, Allocation=19), with or without a context,
      * so a truncate on a context-less handle -- which passes
-     * through untranslated -- shows up. The 2.txt 513 -> 8
-     * truncation has to come from somewhere. */
+     * through untranslated -- shows up. */
     if ((FileInformationClass == WW_FileEndOfFileInformation ||
          FileInformationClass == WW_FileAllocationInformation) && Length >= 8) {
         LONGLONG v = *(LONGLONG *)FileInformation;
         WwEngLog(2, "ntset: h=%p class=%d val=%lld ctx=%d", FileHandle,
                  (int)FileInformationClass, v, ctx ? 1 : 0);
     }
+    /* Faithful copy of the vendor's FUN_18002bfc0: BOTH the
+     * EndOfFile (20) and the AllocationSize (19) are translated
+     * +512, because the physical file is 512 bytes longer than
+     * the logical content. Missing the Allocation translation
+     * is what truncated 2.txt: Notepad sets EOF=1 (translated
+     * to 513) and Allocation=1 (left at 1), and the filesystem
+     * then truncates the file to the 1-byte allocation -- the
+     * 8-byte remnant is the first 8 bytes of the header.
+     * After the real call the caller's buffer is restored
+     * (-512), exactly like the vendor. */
     if (ctx && ctx->is_encrypted) {
-        if (FileInformationClass == WW_FileEndOfFileInformation && Length >= sizeof(WW_FILE_END_OF_FILE_INFORMATION)) {
-            WW_FILE_END_OF_FILE_INFORMATION *ei = (WW_FILE_END_OF_FILE_INFORMATION *)FileInformation;
-            if (ei->EndOfFile.QuadPart >= 0)
-                ei->EndOfFile.QuadPart += WWFLT_HEADER_SIZE;
+        if ((FileInformationClass == WW_FileEndOfFileInformation ||
+             FileInformationClass == WW_FileAllocationInformation) &&
+            Length >= sizeof(LARGE_INTEGER)) {
+            LARGE_INTEGER *sz = (LARGE_INTEGER *)FileInformation;
+            if (sz->QuadPart >= 0)
+                sz->QuadPart += WWFLT_HEADER_SIZE;
         } else if (FileInformationClass == WW_FilePositionInformation && Length >= sizeof(WW_FILE_POSITION_INFORMATION)) {
             WW_FILE_POSITION_INFORMATION *pi = (WW_FILE_POSITION_INFORMATION *)FileInformation;
             WwEngLog(2, "ntset: h=%p class=Position val=%lld",
@@ -1411,8 +1422,20 @@ static NTSTATUS NTAPI WwHookNtSetInformationFile(HANDLE FileHandle,
         }
     }
     LeaveCriticalSection(&gCtxLock);
-    return gOrigNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
-                                     Length, FileInformationClass);
+    {
+        NTSTATUS st = gOrigNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                                Length, FileInformationClass);
+        /* Restore the caller's buffer (vendor does this too). */
+        if (ctx && ctx->is_encrypted &&
+            (FileInformationClass == WW_FileEndOfFileInformation ||
+             FileInformationClass == WW_FileAllocationInformation) &&
+            Length >= sizeof(LARGE_INTEGER)) {
+            LARGE_INTEGER *sz = (LARGE_INTEGER *)FileInformation;
+            if (sz->QuadPart >= WWFLT_HEADER_SIZE)
+                sz->QuadPart -= WWFLT_HEADER_SIZE;
+        }
+        return st;
+    }
 }
 
 static NTSTATUS NTAPI WwHookNtQueryInformationFile(HANDLE FileHandle,
@@ -1448,6 +1471,12 @@ static NTSTATUS NTAPI WwHookNtQueryInformationFile(HANDLE FileHandle,
             ei->EndOfFile.QuadPart -= WWFLT_HEADER_SIZE;
         else
             ei->EndOfFile.QuadPart = 0;
+    } else if (FileInformationClass == WW_FileAllocationInformation && Length >= sizeof(LARGE_INTEGER)) {
+        LARGE_INTEGER *al = (LARGE_INTEGER *)FileInformation;
+        if (al->QuadPart >= WWFLT_HEADER_SIZE)
+            al->QuadPart -= WWFLT_HEADER_SIZE;
+        else
+            al->QuadPart = 0;
     }
     LeaveCriticalSection(&gCtxLock);
     return st;
