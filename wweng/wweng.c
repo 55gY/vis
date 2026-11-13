@@ -1274,11 +1274,13 @@ static NTSTATUS NTAPI WwHookNtCreateSection(PHANDLE SectionHandle, ACCESS_MASK D
     }
     logical_size = phys_size - WWFLT_HEADER_SIZE;
     if (logical_size <= 0) {
-        /* Empty content: hand back an anonymous 1-byte section so
-         * the caller maps an empty view instead of the raw header. */
         logical_size = 0;
     }
-    /* Read the ciphertext (physical, offset 512) and decrypt it. */
+    /* Read the ciphertext (physical, offset 512) and decrypt it.
+     * Faithful copy of the vendor's FUN_18002a440: read in chunks
+     * from the physical offset, decrypt each chunk with the
+     * LOGICAL offset as counter, and lay the plaintext
+     * contiguously into the destination starting at offset 0. */
     buf = (unsigned char *)malloc((size_t)(logical_size > 0 ? logical_size : 1));
     if (!buf) {
         LeaveCriticalSection(&gCtxLock);
@@ -1286,18 +1288,28 @@ static NTSTATUS NTAPI WwHookNtCreateSection(PHANDLE SectionHandle, ACCESS_MASK D
                                     MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
     }
     if (logical_size > 0) {
-        LARGE_INTEGER phys;
-        WW_IO_STATUS_BLOCK iosb;
-        phys.QuadPart = WWFLT_HEADER_SIZE;
-        st = gOrigNtReadFile(FileHandle, NULL, NULL, NULL, &iosb,
-                             buf, (ULONG)logical_size, &phys, NULL);
-        if (!WW_NT_SUCCESS(st) || (LONGLONG)iosb.Information != logical_size) {
-            free(buf);
-            LeaveCriticalSection(&gCtxLock);
-            return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
-                                        MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
+        /* Chunked fill, like the vendor (8KB temp buffer). */
+        LONGLONG phys_off = WWFLT_HEADER_SIZE;  /* physical offset */
+        LONGLONG done = 0;                      /* logical bytes filled */
+        while (done < logical_size) {
+            ULONG chunk = (ULONG)(logical_size - done);
+            WW_IO_STATUS_BLOCK iosb;
+            LARGE_INTEGER off;
+            if (chunk > 8192) chunk = 8192;
+            off.QuadPart = phys_off;
+            st = gOrigNtReadFile(FileHandle, NULL, NULL, NULL, &iosb,
+                                 buf + done, chunk, &off, NULL);
+            if (!WW_NT_SUCCESS(st) || iosb.Information == 0) {
+                free(buf);
+                LeaveCriticalSection(&gCtxLock);
+                return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
+                                            MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
+            }
+            WwSboxDecrypt(&ctx->sbox, buf + done, (size_t)iosb.Information,
+                          (ULONGLONG)done);
+            done += (LONGLONG)iosb.Information;
+            phys_off += (LONGLONG)iosb.Information;
         }
-        WwSboxDecrypt(&ctx->sbox, buf, (size_t)logical_size, 0);
         /* Diagnostic: first bytes of the decrypted content, so a
          * wrong key/sbox shows up immediately in the log. */
         {
@@ -1316,13 +1328,12 @@ static NTSTATUS NTAPI WwHookNtCreateSection(PHANDLE SectionHandle, ACCESS_MASK D
     LeaveCriticalSection(&gCtxLock);
     /* Anonymous section holding the plaintext. PAGE_READWRITE so we
      * can copy the data in; the caller may map it read-only.
-     * NOTE: create it with SECTION_ALL_ACCESS (0xf001f, like the
-     * vendor does), NOT the caller's DesiredAccess. A read-only
-     * caller asks for SECTION_MAP_READ only, and mapping such a
-     * section PAGE_READWRITE to populate it fails -- which silently
-     * fell back to the real (encrypted) section and left 1.txt
-     * garbled. */
-    maxsz.QuadPart = logical_size > 0 ? logical_size : 1;
+     * Faithful copy of the vendor's FUN_18002a6a0: MaximumSize is
+     * the PHYSICAL file size (not the logical size), DesiredAccess
+     * is SECTION_ALL_ACCESS (0xf001f), protection PAGE_READWRITE,
+     * SEC_COMMIT. The plaintext is laid at view offset 0; the
+     * rest of the (physical-sized) section stays zero. */
+    maxsz.QuadPart = phys_size;
     st = gOrigNtCreateSection(&anon, 0xf001f /* SECTION_ALL_ACCESS */, ObjectAttributes, &maxsz,
                               0x04 /* PAGE_READWRITE */, 0x08000000 /* SEC_COMMIT */, NULL);
     if (!WW_NT_SUCCESS(st) || !anon) {
