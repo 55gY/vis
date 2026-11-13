@@ -1,8 +1,12 @@
 /* wweng.h -- engine DLL (user mode) for the new WaterWall client.
  * Architecture (vendor-style, all our own code):
  *   - an injection driver loads this DLL into target processes;
- *   - the DLL hooks file APIs (CreateFile/ReadFile/WriteFile/...) via IAT
- *     patching and does transparent encryption/decryption per .xcf policy.
+ *   - the DLL hooks file APIs (CreateFile/ReadFile/WriteFile/...) via
+ *     Microsoft Detours (inline/trampoline patching of the function
+ *     body), the same mechanism the vendor engine uses, and does
+ *     transparent encryption/decryption per .xcf policy. IAT patching
+ *     was dropped: Win10 imports file APIs from API-set DLLs, so an
+ *     IAT filter on kernel32.dll silently skipped every file API.
  *
  * File format (matches the old client, so files stay compatible):
  *   512-byte header + ciphertext. Header: 16-byte magic, version u16 at

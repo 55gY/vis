@@ -1,5 +1,17 @@
-/* wweng.c -- engine DLL. Hooks file APIs via IAT patching and does
- * transparent encryption/decryption per .xcf policy.
+/* wweng.c -- engine DLL. Hooks file APIs via Microsoft Detours
+ * (inline/trampoline patching of the function body in kernelbase.dll)
+ * and does transparent encryption/decryption per .xcf policy.
+ *
+ * Why Detours, not IAT: the vendor engine (wwkrn64.dll) hooks with
+ * Detours, and IAT patching is fragile on Win10 -- Notepad imports
+ * CreateFileW/ReadFile/WriteFile from API-set DLLs
+ * (api-ms-win-core-file-l1-1-0.dll), not kernel32.dll, so an IAT
+ * filter on dll=="kernel32.dll" silently skips every file-API import
+ * (wwnew-5/wweng-2.log: iat_patched=9 but zero 'hook: CreateFileW').
+ * Detours patches the function body itself, so every caller is
+ * intercepted regardless of import path. Newly loaded modules need no
+ * re-patching (they call the same function body), so there is no
+ * LoadLibrary hook any more.
  *
  * Notes / Phase 1 limits:
  * - Only synchronous (non-overlapped) ReadFile/WriteFile are filtered.
@@ -9,7 +21,8 @@
  * - The per-handle context list is guarded by gCtxLock, held during a
  *   whole hooked call (simple; Notepad is single-threaded for file I/O).
  * - Internal file I/O (policy load, logging) always uses the saved
- *   ORIGINAL function pointers, never the hooked ones.
+ *   ORIGINAL function pointers (now the Detours trampolines), never the
+ *   hooked ones.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -17,11 +30,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "wweng.h"
-#include "iat.h"
+#include "detours/detours.h"
 #include "policy_build.h"
 #include "xcf.h"
 
-/* ---- originals (filled by the IAT hook table) ---- */
+/* ---- originals (Detours trampolines; filled by DetourAttach) ---- */
 static HANDLE (WINAPI *gOrigCreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE) = NULL;
 static HANDLE (WINAPI *gOrigCreateFileA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE) = NULL;
 static BOOL (WINAPI *gOrigReadFile)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED) = NULL;
@@ -32,9 +45,6 @@ static BOOL (WINAPI *gOrigSetFilePointerEx)(HANDLE, LARGE_INTEGER, PLARGE_INTEGE
 static DWORD (WINAPI *gOrigGetFileSize)(HANDLE, LPDWORD) = NULL;
 static BOOL (WINAPI *gOrigGetFileSizeEx)(HANDLE, PLARGE_INTEGER) = NULL;
 static BOOL (WINAPI *gOrigSetEndOfFile)(HANDLE) = NULL;
-static HMODULE (WINAPI *gOrigLoadLibraryW)(LPCWSTR) = NULL;
-static HMODULE (WINAPI *gOrigLoadLibraryA)(LPCSTR) = NULL;
-static HMODULE (WINAPI *gOrigLoadLibraryExW)(LPCWSTR, HANDLE, DWORD) = NULL;
 
 /* ---- globals ---- */
 static HMODULE gOwnModule = NULL;
@@ -604,56 +614,55 @@ static BOOL WINAPI WwHookSetEndOfFile(HANDLE hFile)
     return ok;
 }
 
-static HMODULE WINAPI WwHookLoadLibraryW(LPCWSTR lpLibFileName)
+/* ---- Detours install ----
+ * Patches the function bodies in kernelbase.dll (via kernel32's
+ * GetProcAddress, which resolves to the same addresses). DetourAttach
+ * rewrites each gOrig* slot to the trampoline, so the hooks above call
+ * through to the real function. One transaction for all hooks.
+ * No LoadLibrary hook: a function-body patch is process-wide, so
+ * modules loaded later call the same patched body automatically.
+ * Returns the number of hooks successfully attached. */
+static int WwDetoursInstall(void)
 {
-    HMODULE m = gOrigLoadLibraryW(lpLibFileName);
-    if (m) {
-        extern const WW_IAT_HOOK gHooks[];
-        extern const int gHookCount;
-        WwIatHookModule(m, gHooks, gHookCount);
-    }
-    return m;
-}
+    HMODULE k32;
+    LONG err;
+    int n = 0;
 
-static HMODULE WINAPI WwHookLoadLibraryA(LPCSTR lpLibFileName)
-{
-    HMODULE m = gOrigLoadLibraryA(lpLibFileName);
-    if (m) {
-        extern const WW_IAT_HOOK gHooks[];
-        extern const int gHookCount;
-        WwIatHookModule(m, gHooks, gHookCount);
-    }
-    return m;
-}
+    k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) return 0;
+    /* Resolve the real addresses first (DetourAttach needs them in
+     * the gOrig* slots). */
+    if (!gOrigCreateFileW) gOrigCreateFileW = (void *)GetProcAddress(k32, "CreateFileW");
+    if (!gOrigCreateFileA) gOrigCreateFileA = (void *)GetProcAddress(k32, "CreateFileA");
+    if (!gOrigReadFile) gOrigReadFile = (void *)GetProcAddress(k32, "ReadFile");
+    if (!gOrigWriteFile) gOrigWriteFile = (void *)GetProcAddress(k32, "WriteFile");
+    if (!gOrigCloseHandle) gOrigCloseHandle = (void *)GetProcAddress(k32, "CloseHandle");
+    if (!gOrigSetFilePointer) gOrigSetFilePointer = (void *)GetProcAddress(k32, "SetFilePointer");
+    if (!gOrigSetFilePointerEx) gOrigSetFilePointerEx = (void *)GetProcAddress(k32, "SetFilePointerEx");
+    if (!gOrigGetFileSize) gOrigGetFileSize = (void *)GetProcAddress(k32, "GetFileSize");
+    if (!gOrigGetFileSizeEx) gOrigGetFileSizeEx = (void *)GetProcAddress(k32, "GetFileSizeEx");
+    if (!gOrigSetEndOfFile) gOrigSetEndOfFile = (void *)GetProcAddress(k32, "SetEndOfFile");
 
-static HMODULE WINAPI WwHookLoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags)
-{
-    HMODULE m = gOrigLoadLibraryExW(lpLibFileName, hFile, dwFlags);
-    if (m) {
-        extern const WW_IAT_HOOK gHooks[];
-        extern const int gHookCount;
-        WwIatHookModule(m, gHooks, gHookCount);
+    err = DetourTransactionBegin();
+    if (err != NO_ERROR) return 0;
+    DetourUpdateThread(GetCurrentThread());
+    if (gOrigCreateFileW) { err = DetourAttach((PVOID*)&gOrigCreateFileW, WwHookCreateFileW); if (err == NO_ERROR) n++; }
+    if (gOrigCreateFileA) { err = DetourAttach((PVOID*)&gOrigCreateFileA, WwHookCreateFileA); if (err == NO_ERROR) n++; }
+    if (gOrigReadFile) { err = DetourAttach((PVOID*)&gOrigReadFile, WwHookReadFile); if (err == NO_ERROR) n++; }
+    if (gOrigWriteFile) { err = DetourAttach((PVOID*)&gOrigWriteFile, WwHookWriteFile); if (err == NO_ERROR) n++; }
+    if (gOrigCloseHandle) { err = DetourAttach((PVOID*)&gOrigCloseHandle, WwHookCloseHandle); if (err == NO_ERROR) n++; }
+    if (gOrigSetFilePointer) { err = DetourAttach((PVOID*)&gOrigSetFilePointer, WwHookSetFilePointer); if (err == NO_ERROR) n++; }
+    if (gOrigSetFilePointerEx) { err = DetourAttach((PVOID*)&gOrigSetFilePointerEx, WwHookSetFilePointerEx); if (err == NO_ERROR) n++; }
+    if (gOrigGetFileSize) { err = DetourAttach((PVOID*)&gOrigGetFileSize, WwHookGetFileSize); if (err == NO_ERROR) n++; }
+    if (gOrigGetFileSizeEx) { err = DetourAttach((PVOID*)&gOrigGetFileSizeEx, WwHookGetFileSizeEx); if (err == NO_ERROR) n++; }
+    if (gOrigSetEndOfFile) { err = DetourAttach((PVOID*)&gOrigSetEndOfFile, WwHookSetEndOfFile); if (err == NO_ERROR) n++; }
+    err = DetourTransactionCommit();
+    if (err != NO_ERROR) {
+        DetourTransactionAbort();
+        return 0;
     }
-    return m;
+    return n;
 }
-
-/* ---- hook table ---- */
-const WW_IAT_HOOK gHooks[] = {
-    { "kernel32.dll", "CreateFileW", (void *)WwHookCreateFileW, (void **)&gOrigCreateFileW },
-    { "kernel32.dll", "CreateFileA", (void *)WwHookCreateFileA, (void **)&gOrigCreateFileA },
-    { "kernel32.dll", "ReadFile", (void *)WwHookReadFile, (void **)&gOrigReadFile },
-    { "kernel32.dll", "WriteFile", (void *)WwHookWriteFile, (void **)&gOrigWriteFile },
-    { "kernel32.dll", "CloseHandle", (void *)WwHookCloseHandle, (void **)&gOrigCloseHandle },
-    { "kernel32.dll", "SetFilePointer", (void *)WwHookSetFilePointer, (void **)&gOrigSetFilePointer },
-    { "kernel32.dll", "SetFilePointerEx", (void *)WwHookSetFilePointerEx, (void **)&gOrigSetFilePointerEx },
-    { "kernel32.dll", "GetFileSize", (void *)WwHookGetFileSize, (void **)&gOrigGetFileSize },
-    { "kernel32.dll", "GetFileSizeEx", (void *)WwHookGetFileSizeEx, (void **)&gOrigGetFileSizeEx },
-    { "kernel32.dll", "SetEndOfFile", (void *)WwHookSetEndOfFile, (void **)&gOrigSetEndOfFile },
-    { "kernel32.dll", "LoadLibraryW", (void *)WwHookLoadLibraryW, (void **)&gOrigLoadLibraryW },
-    { "kernel32.dll", "LoadLibraryA", (void *)WwHookLoadLibraryA, (void **)&gOrigLoadLibraryA },
-    { "kernel32.dll", "LoadLibraryExW", (void *)WwHookLoadLibraryExW, (void **)&gOrigLoadLibraryExW },
-};
-const int gHookCount = (int)(sizeof(gHooks) / sizeof(gHooks[0]));
 
 /* ---- DllMain ---- */
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
@@ -664,45 +673,23 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         DisableThreadLibraryCalls(hinstDLL);
         InitializeCriticalSection(&gCtxLock);
         InitializeCriticalSection(&gPolicyLock);
-        WwIatSetOwnModule(gOwnModule);
-        /* Pre-fill originals from the real kernel32 in case a module has
-         * no IAT entry for one of these (then the hook stays uninstalled
-         * for that module but the original is still usable). */
-        {
-            HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-            if (k32) {
-                if (!gOrigCreateFileW) gOrigCreateFileW = (void *)GetProcAddress(k32, "CreateFileW");
-                if (!gOrigCreateFileA) gOrigCreateFileA = (void *)GetProcAddress(k32, "CreateFileA");
-                if (!gOrigReadFile) gOrigReadFile = (void *)GetProcAddress(k32, "ReadFile");
-                if (!gOrigWriteFile) gOrigWriteFile = (void *)GetProcAddress(k32, "WriteFile");
-                if (!gOrigCloseHandle) gOrigCloseHandle = (void *)GetProcAddress(k32, "CloseHandle");
-                if (!gOrigSetFilePointer) gOrigSetFilePointer = (void *)GetProcAddress(k32, "SetFilePointer");
-                if (!gOrigSetFilePointerEx) gOrigSetFilePointerEx = (void *)GetProcAddress(k32, "SetFilePointerEx");
-                if (!gOrigGetFileSize) gOrigGetFileSize = (void *)GetProcAddress(k32, "GetFileSize");
-                if (!gOrigGetFileSizeEx) gOrigGetFileSizeEx = (void *)GetProcAddress(k32, "GetFileSizeEx");
-                if (!gOrigSetEndOfFile) gOrigSetEndOfFile = (void *)GetProcAddress(k32, "SetEndOfFile");
-                if (!gOrigLoadLibraryW) gOrigLoadLibraryW = (void *)GetProcAddress(k32, "LoadLibraryW");
-                if (!gOrigLoadLibraryA) gOrigLoadLibraryA = (void *)GetProcAddress(k32, "LoadLibraryA");
-                if (!gOrigLoadLibraryExW) gOrigLoadLibraryExW = (void *)GetProcAddress(k32, "LoadLibraryExW");
-            }
-        }
         /* Eager diagnostics: set up the log path FIRST so the log
-         * exists even if no hooked call ever happens, then log how
-         * many IAT entries were patched and load the policy eagerly.
-         * (Before this, the log was created only lazily from the
-         * first hooked call, so a DLL that was injected but whose
-         * hooks never fired left no trace at all.) */
+         * exists even if no hooked call ever happens, then install
+         * the Detours hooks and load the policy eagerly. (Before
+         * this, the log was created only lazily from the first
+         * hooked call, so a DLL that was injected but whose hooks
+         * never fired left no trace at all.) */
         WwEngInitLogPath();
         {
             WCHAR exeName[MAX_PATH];
-            int patched;
+            int attached;
             GetOwnExeName(exeName, MAX_PATH);
-            patched = WwIatHookAllModules(gHooks, gHookCount);
-            WwEngLog(1, "attach: exe=%ls iat_patched=%d", exeName, patched);
+            attached = WwDetoursInstall();
+            WwEngLog(1, "attach: exe=%ls detours_attached=%d", exeName, attached);
         }
         WwEngEnsureInit();
     } else if (fdwReason == DLL_PROCESS_DETACH) {
-        /* Best effort: free contexts. Do not unpatch IATs. */
+        /* Best effort: free contexts. Do not detach the hooks. */
         WW_FILE_CTX *c, *next;
         EnterCriticalSection(&gCtxLock);
         for (c = gCtxList; c; c = next) {
