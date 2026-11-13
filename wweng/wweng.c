@@ -150,6 +150,19 @@ static BOOL NtGetPosition(HANDLE h, LONGLONG *pos)
     return TRUE;
 }
 
+/* Set the file position directly through the original
+ * NtSetInformationFile (bypasses our own hook). */
+static BOOL NtSetPosition(HANDLE h, PLARGE_INTEGER pos)
+{
+    WW_IO_STATUS_BLOCK iosb;
+    WW_FILE_POSITION_INFORMATION pi;
+    NTSTATUS st;
+    if (!gOrigNtSetInformationFile) return FALSE;
+    pi.CurrentByteOffset = *pos;
+    st = gOrigNtSetInformationFile(h, &iosb, &pi, sizeof(pi), WW_FilePositionInformation);
+    return WW_NT_SUCCESS(st);
+}
+
 /* ---- globals ---- */
 static HMODULE gOwnModule = NULL;
 static CRITICAL_SECTION gCtxLock;
@@ -391,6 +404,10 @@ static void WwEngOnCreate(HANDLE h, LPCWSTR lpFileName, DWORD dwDesiredAccess,
         EnterCriticalSection(&gCtxLock);
         WwEngInsertCtx(ctx);
         LeaveCriticalSection(&gCtxLock);
+        /* Logical view: the caller sees position 0 = content start.
+         * The 512-byte header is transparent (the read/write hooks
+         * add 512). Seek back to 0, like the vendor does. */
+        gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
         WwEngLog(2, "create: new encrypted %ls mode=%lu", lpFileName, mode);
         return;
     }
@@ -413,7 +430,10 @@ static void WwEngOnCreate(HANDLE h, LPCWSTR lpFileName, DWORD dwDesiredAccess,
             gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
             return;
         }
-        /* Encrypted: position is already at 512 (logical 0). Keep it. */
+        /* Encrypted: seek back to 0. The caller sees a logical view
+         * (position 0 = content start); the read/write hooks add 512
+         * to reach the physical data. This matches the vendor. */
+        gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
         ctx = (WW_FILE_CTX *)calloc(1, sizeof(WW_FILE_CTX));
         if (!ctx) {
             gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
@@ -776,9 +796,10 @@ static NTSTATUS NTAPI WwHookNtReadFile(HANDLE FileHandle, HANDLE Event,
 {
     WW_FILE_CTX *ctx;
     NTSTATUS st;
-    LONGLONG phys_off;
-    ULONGLONG logical_off;
+    LONGLONG logical_off;
     ULONG read = 0;
+    BOOL use_explicit_off = FALSE;
+    LARGE_INTEGER saved_off;
 
     /* Async I/O passes through, like overlapped I/O in Win32. */
     if (Event || ApcRoutine) {
@@ -792,25 +813,57 @@ static NTSTATUS NTAPI WwHookNtReadFile(HANDLE FileHandle, HANDLE Event,
         return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                                Buffer, Length, ByteOffset, Key);
     }
+    /* The caller works in a LOGICAL view (0 = content start, the
+     * 512-byte header is invisible). Translate to physical by
+     * adding 512, exactly like the vendor's read hook: it rewrites
+     * ByteOffset in place (+0x200), or moves the file position
+     * (+0x200) and restores it afterwards. */
     if (ByteOffset) {
-        phys_off = ByteOffset->QuadPart;
-    } else if (!NtGetPosition(FileHandle, &phys_off)) {
-        LeaveCriticalSection(&gCtxLock);
-        return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                               Buffer, Length, ByteOffset, Key);
+        logical_off = ByteOffset->QuadPart;
+        if (logical_off < 0) {
+            LeaveCriticalSection(&gCtxLock);
+            return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                   Buffer, Length, ByteOffset, Key);
+        }
+        use_explicit_off = TRUE;
+        saved_off.QuadPart = logical_off;
+        ByteOffset->QuadPart = logical_off + WWFLT_HEADER_SIZE;
+    } else {
+        if (!NtGetPosition(FileHandle, &logical_off)) {
+            LeaveCriticalSection(&gCtxLock);
+            return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                   Buffer, Length, ByteOffset, Key);
+        }
+        if (logical_off < 0) {
+            LeaveCriticalSection(&gCtxLock);
+            return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                   Buffer, Length, ByteOffset, Key);
+        }
+        saved_off.QuadPart = logical_off;
+        {
+            LARGE_INTEGER phys;
+            phys.QuadPart = logical_off + WWFLT_HEADER_SIZE;
+            if (!NtSetPosition(FileHandle, &phys)) {
+                LeaveCriticalSection(&gCtxLock);
+                return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                       Buffer, Length, ByteOffset, Key);
+            }
+        }
     }
-    if (phys_off < WWFLT_HEADER_SIZE) {
-        /* Header read: pass through undecrypted. */
-        LeaveCriticalSection(&gCtxLock);
-        return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                               Buffer, Length, ByteOffset, Key);
-    }
-    logical_off = (ULONGLONG)(phys_off - WWFLT_HEADER_SIZE);
     st = gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                          Buffer, Length, ByteOffset, Key);
     if (WW_NT_SUCCESS(st) && IoStatusBlock && IoStatusBlock->Information > 0) {
         read = (ULONG)IoStatusBlock->Information;
-        WwSboxDecrypt(&ctx->sbox, (unsigned char *)Buffer, read, logical_off);
+        WwSboxDecrypt(&ctx->sbox, (unsigned char *)Buffer, read, (ULONGLONG)logical_off);
+        WwEngLog(2, "ntread: h=%p logical=%lld bytes=%lu", FileHandle, logical_off, read);
+    }
+    /* Restore the caller's logical view of the position. */
+    if (use_explicit_off) {
+        ByteOffset->QuadPart = saved_off.QuadPart;
+    } else if (WW_NT_SUCCESS(st) && IoStatusBlock) {
+        LARGE_INTEGER cur;
+        cur.QuadPart = saved_off.QuadPart + (LONGLONG)read;
+        NtSetPosition(FileHandle, &cur);
     }
     LeaveCriticalSection(&gCtxLock);
     return st;
@@ -822,9 +875,11 @@ static NTSTATUS NTAPI WwHookNtWriteFile(HANDLE FileHandle, HANDLE Event,
 {
     WW_FILE_CTX *ctx;
     NTSTATUS st;
-    LONGLONG phys_off;
-    ULONGLONG logical_off;
+    LONGLONG logical_off;
     unsigned char *tmp = NULL;
+    BOOL use_explicit_off = FALSE;
+    LARGE_INTEGER saved_off;
+    ULONG written = 0;
 
     if (Event || ApcRoutine) {
         return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
@@ -837,30 +892,56 @@ static NTSTATUS NTAPI WwHookNtWriteFile(HANDLE FileHandle, HANDLE Event,
         return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                                 Buffer, Length, ByteOffset, Key);
     }
+    /* Logical view, like the read hook: add 512 to reach the physical
+     * data, encrypt with the logical offset as counter. */
     if (ByteOffset) {
-        phys_off = ByteOffset->QuadPart;
-    } else if (!NtGetPosition(FileHandle, &phys_off)) {
-        LeaveCriticalSection(&gCtxLock);
-        return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                                Buffer, Length, ByteOffset, Key);
+        logical_off = ByteOffset->QuadPart;
+        if (logical_off < 0) {
+            LeaveCriticalSection(&gCtxLock);
+            return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                    Buffer, Length, ByteOffset, Key);
+        }
+        use_explicit_off = TRUE;
+        saved_off.QuadPart = logical_off;
+        ByteOffset->QuadPart = logical_off + WWFLT_HEADER_SIZE;
+    } else {
+        if (!NtGetPosition(FileHandle, &logical_off) || logical_off < 0) {
+            LeaveCriticalSection(&gCtxLock);
+            return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                    Buffer, Length, ByteOffset, Key);
+        }
+        saved_off.QuadPart = logical_off;
+        {
+            LARGE_INTEGER phys;
+            phys.QuadPart = logical_off + WWFLT_HEADER_SIZE;
+            if (!NtSetPosition(FileHandle, &phys)) {
+                LeaveCriticalSection(&gCtxLock);
+                return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                        Buffer, Length, ByteOffset, Key);
+            }
+        }
     }
-    if (phys_off < WWFLT_HEADER_SIZE) {
-        LeaveCriticalSection(&gCtxLock);
-        return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                                Buffer, Length, ByteOffset, Key);
-    }
-    logical_off = (ULONGLONG)(phys_off - WWFLT_HEADER_SIZE);
     tmp = (unsigned char *)malloc(Length ? Length : 1);
     if (!tmp) {
+        if (use_explicit_off) ByteOffset->QuadPart = saved_off.QuadPart;
+        else NtSetPosition(FileHandle, &saved_off);
         LeaveCriticalSection(&gCtxLock);
         if (IoStatusBlock) { IoStatusBlock->Status = 0xC0000017; IoStatusBlock->Information = 0; }
         return 0xC0000017; /* STATUS_NO_MEMORY */
     }
     memcpy(tmp, Buffer, Length);
-    WwSboxEncrypt(&ctx->sbox, tmp, Length, logical_off);
+    WwSboxEncrypt(&ctx->sbox, tmp, Length, (ULONGLONG)logical_off);
     st = gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                           tmp, Length, ByteOffset, Key);
     free(tmp);
+    if (use_explicit_off) {
+        ByteOffset->QuadPart = saved_off.QuadPart;
+    } else if (WW_NT_SUCCESS(st) && IoStatusBlock) {
+        LARGE_INTEGER cur;
+        written = (ULONG)IoStatusBlock->Information;
+        cur.QuadPart = saved_off.QuadPart + (LONGLONG)written;
+        NtSetPosition(FileHandle, &cur);
+    }
     LeaveCriticalSection(&gCtxLock);
     return st;
 }
@@ -877,8 +958,22 @@ static NTSTATUS NTAPI WwHookNtSetInformationFile(HANDLE FileHandle,
     PWW_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
     WW_FILE_INFORMATION_CLASS FileInformationClass)
 {
-    /* Position and end-of-file are physical offsets already including
-     * the header; pass through. Size translation is done in Query. */
+    WW_FILE_CTX *ctx;
+    /* The raw file position is kept in the LOGICAL view (0 = content
+     * start); the read/write hooks add 512 themselves for the I/O
+     * and restore it. So a seek passes through untranslated. Only
+     * a truncate (EndOfFile) needs +512, because the physical file
+     * is 512 bytes longer than the logical content. */
+    EnterCriticalSection(&gCtxLock);
+    ctx = WwEngFindCtx(FileHandle);
+    if (ctx && ctx->is_encrypted) {
+        if (FileInformationClass == WW_FileEndOfFileInformation && Length >= sizeof(WW_FILE_END_OF_FILE_INFORMATION)) {
+            WW_FILE_END_OF_FILE_INFORMATION *ei = (WW_FILE_END_OF_FILE_INFORMATION *)FileInformation;
+            if (ei->EndOfFile.QuadPart >= 0)
+                ei->EndOfFile.QuadPart += WWFLT_HEADER_SIZE;
+        }
+    }
+    LeaveCriticalSection(&gCtxLock);
     return gOrigNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
                                      Length, FileInformationClass);
 }
@@ -899,7 +994,9 @@ static NTSTATUS NTAPI WwHookNtQueryInformationFile(HANDLE FileHandle,
         return st;
     }
     /* Report the LOGICAL size (physical - 512) so callers see the
-     * plaintext length. */
+     * plaintext length. The file position is already logical (the
+     * raw position is maintained in the logical view), so it is
+     * reported as-is. */
     if (FileInformationClass == WW_FileStandardInformation && Length >= sizeof(WW_FILE_STANDARD_INFORMATION)) {
         WW_FILE_STANDARD_INFORMATION *si = (WW_FILE_STANDARD_INFORMATION *)FileInformation;
         if (si->EndOfFile.QuadPart >= WWFLT_HEADER_SIZE)
