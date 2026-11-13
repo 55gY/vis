@@ -87,6 +87,7 @@ typedef struct _WW_FILE_STANDARD_INFORMATION {
 typedef enum _WW_FILE_INFORMATION_CLASS {
     WW_FileStandardInformation = 5,
     WW_FilePositionInformation = 14,
+    WW_FileAllocationInformation = 19,
     WW_FileEndOfFileInformation = 20
 } WW_FILE_INFORMATION_CLASS;
 
@@ -863,7 +864,9 @@ static NTSTATUS NTAPI WwHookNtCreateFile(PHANDLE FileHandle, ACCESS_MASK Desired
     {
         size_t n = wcslen(win32path);
         if (n >= 4 && _wcsicmp(win32path + n - 4, L".txt") == 0) {
-            WwEngLog(2, "hook: NtCreateFile %ls access=0x%lx", win32path, DesiredAccess);
+            /* Diagnostic: CreateDisposition tells whether an open
+             * truncates (CREATE_ALWAYS=2, TRUNCATE_EXISTING=5). */
+            WwEngLog(2, "hook: NtCreateFile %ls access=0x%lx disp=%lu", win32path, DesiredAccess, CreateDisposition);
         }
     }
     EnterCriticalSection(&gCtxLock);
@@ -1216,6 +1219,16 @@ static NTSTATUS NTAPI WwHookNtWriteFile(HANDLE FileHandle, HANDLE Event,
 static NTSTATUS NTAPI WwHookNtClose(HANDLE Handle)
 {
     EnterCriticalSection(&gCtxLock);
+    {
+        /* Diagnostic: physical size at close, to catch the 2.txt
+         * 513 -> 8 truncation window. */
+        WW_FILE_CTX *ctx = WwEngFindCtx(Handle);
+        if (ctx && ctx->is_encrypted) {
+            LONGLONG sz = -1;
+            NtGetFileSizeRaw(Handle, &sz);
+            WwEngLog(2, "ntclose: h=%p phys=%lld", Handle, sz);
+        }
+    }
     WwEngRemoveCtx(Handle);
     LeaveCriticalSection(&gCtxLock);
     return gOrigNtClose(Handle);
@@ -1375,12 +1388,20 @@ static NTSTATUS NTAPI WwHookNtSetInformationFile(HANDLE FileHandle,
      * is 512 bytes longer than the logical content. */
     EnterCriticalSection(&gCtxLock);
     ctx = WwEngFindCtx(FileHandle);
+    /* Diagnostic: log every size-changing SetInformationFile call
+     * (EndOfFile=20, Allocation=19), with or without a context,
+     * so a truncate on a context-less handle -- which passes
+     * through untranslated -- shows up. The 2.txt 513 -> 8
+     * truncation has to come from somewhere. */
+    if ((FileInformationClass == WW_FileEndOfFileInformation ||
+         FileInformationClass == WW_FileAllocationInformation) && Length >= 8) {
+        LONGLONG v = *(LONGLONG *)FileInformation;
+        WwEngLog(2, "ntset: h=%p class=%d val=%lld ctx=%d", FileHandle,
+                 (int)FileInformationClass, v, ctx ? 1 : 0);
+    }
     if (ctx && ctx->is_encrypted) {
         if (FileInformationClass == WW_FileEndOfFileInformation && Length >= sizeof(WW_FILE_END_OF_FILE_INFORMATION)) {
             WW_FILE_END_OF_FILE_INFORMATION *ei = (WW_FILE_END_OF_FILE_INFORMATION *)FileInformation;
-            WwEngLog(2, "ntset: h=%p class=EndOfFile val=%lld -> %lld",
-                     FileHandle, ei->EndOfFile.QuadPart,
-                     ei->EndOfFile.QuadPart >= 0 ? ei->EndOfFile.QuadPart + WWFLT_HEADER_SIZE : ei->EndOfFile.QuadPart);
             if (ei->EndOfFile.QuadPart >= 0)
                 ei->EndOfFile.QuadPart += WWFLT_HEADER_SIZE;
         } else if (FileInformationClass == WW_FilePositionInformation && Length >= sizeof(WW_FILE_POSITION_INFORMATION)) {
