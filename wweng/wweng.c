@@ -163,6 +163,23 @@ static BOOL NtSetPosition(HANDLE h, PLARGE_INTEGER pos)
     return WW_NT_SUCCESS(st);
 }
 
+/* Physical file size through the ORIGINAL NtQueryInformationFile.
+ * MUST bypass our own hook: the hook reports the logical size
+ * (physical - 512), so a 514-byte encrypted file looks like 2
+ * bytes and OnCreate would dismiss it as "too small for a header".
+ * That is exactly what broke the reopen in wwnew-9/10. */
+static BOOL NtGetFileSizeRaw(HANDLE h, LONGLONG *size)
+{
+    WW_IO_STATUS_BLOCK iosb;
+    WW_FILE_STANDARD_INFORMATION si;
+    NTSTATUS st;
+    if (!gOrigNtQueryInformationFile) return FALSE;
+    st = gOrigNtQueryInformationFile(h, &iosb, &si, sizeof(si), WW_FileStandardInformation);
+    if (!WW_NT_SUCCESS(st)) return FALSE;
+    *size = si.EndOfFile.QuadPart;
+    return TRUE;
+}
+
 /* ---- globals ---- */
 static HMODULE gOwnModule = NULL;
 static CRITICAL_SECTION gCtxLock;
@@ -374,8 +391,9 @@ static void WwEngOnCreate(HANDLE h, LPCWSTR lpFileName, DWORD dwDesiredAccess,
     }
     WwEngLog(2, "policy: MATCH exe=%ls file=%ls mode=%lu policy=%ls",
              exe, lpFileName, mode, policy_name);
-    /* Get the file size. */
-    if (!gOrigGetFileSizeEx(h, &fileSize)) return;
+    /* Get the PHYSICAL file size, bypassing our own Query hook
+     * (it reports logical size = physical - 512). */
+    if (!NtGetFileSizeRaw(h, &fileSize.QuadPart)) return;
     if (fileSize.QuadPart == 0) {
         /* New (or truncated) file. Only WRITE mode creates a header. */
         char asciiPolicy[WWFLT_MAX_GROUP_LEN];
