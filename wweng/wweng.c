@@ -931,9 +931,14 @@ static NTSTATUS NTAPI WwHookNtWriteFile(HANDLE FileHandle, HANDLE Event,
     }
     memcpy(tmp, Buffer, Length);
     WwSboxEncrypt(&ctx->sbox, tmp, Length, (ULONGLONG)logical_off);
+    WwEngLog(2, "ntwrite: h=%p logical=%lld len=%lu expl=%d", FileHandle, logical_off, Length, use_explicit_off ? 1 : 0);
     st = gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                           tmp, Length, ByteOffset, Key);
     free(tmp);
+    if (WW_NT_SUCCESS(st) && IoStatusBlock) {
+        WwEngLog(2, "ntwrite: h=%p done written=%llu", FileHandle,
+                 (unsigned long long)IoStatusBlock->Information);
+    }
     if (use_explicit_off) {
         ByteOffset->QuadPart = saved_off.QuadPart;
     } else if (WW_NT_SUCCESS(st) && IoStatusBlock) {
@@ -969,8 +974,15 @@ static NTSTATUS NTAPI WwHookNtSetInformationFile(HANDLE FileHandle,
     if (ctx && ctx->is_encrypted) {
         if (FileInformationClass == WW_FileEndOfFileInformation && Length >= sizeof(WW_FILE_END_OF_FILE_INFORMATION)) {
             WW_FILE_END_OF_FILE_INFORMATION *ei = (WW_FILE_END_OF_FILE_INFORMATION *)FileInformation;
+            WwEngLog(2, "ntset: h=%p class=EndOfFile val=%lld -> %lld",
+                     FileHandle, ei->EndOfFile.QuadPart,
+                     ei->EndOfFile.QuadPart >= 0 ? ei->EndOfFile.QuadPart + WWFLT_HEADER_SIZE : ei->EndOfFile.QuadPart);
             if (ei->EndOfFile.QuadPart >= 0)
                 ei->EndOfFile.QuadPart += WWFLT_HEADER_SIZE;
+        } else if (FileInformationClass == WW_FilePositionInformation && Length >= sizeof(WW_FILE_POSITION_INFORMATION)) {
+            WW_FILE_POSITION_INFORMATION *pi = (WW_FILE_POSITION_INFORMATION *)FileInformation;
+            WwEngLog(2, "ntset: h=%p class=Position val=%lld",
+                     FileHandle, pi->CurrentByteOffset.QuadPart);
         }
     }
     LeaveCriticalSection(&gCtxLock);
