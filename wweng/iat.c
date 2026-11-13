@@ -1,8 +1,20 @@
 /* iat.c -- IAT hooking. Walks a module's PE import directory, finds the
- * IAT (FirstThunk) entries for the requested DLL/function pairs, and
- * overwrites them with our replacements (after VirtualProtect to make
- * the page writable). Original addresses are returned via the hook
- * table so the hooks can call through.
+ * IAT (FirstThunk) entries for the requested functions, and overwrites
+ * them with our replacements (after VirtualProtect to make the page
+ * writable). Original addresses are returned via the hook table so the
+ * hooks can call through.
+ *
+ * Matching is by RESOLVED ADDRESS, not by import DLL name. On Windows
+ * 10, binaries import CreateFileW/ReadFile/... from API-set DLLs
+ * (api-ms-win-core-file-l1-1-0.dll, ...) rather than kernel32.dll,
+ * so filtering on dll=="kernel32.dll" silently skips every file-API
+ * import -- the hook table only ever matched LoadLibrary-style imports
+ * that still name kernel32.dll. The loader resolves an API-set import
+ * to the same real address in kernelbase.dll as a kernel32.dll import,
+ * so comparing the IAT entry's current value against the known real
+ * address (pre-filled in DllMain via GetProcAddress) catches both.
+ * A name-based fallback is kept for entries whose original address
+ * was never pre-filled.
  */
 #include "iat.h"
 #include <string.h>
@@ -22,6 +34,16 @@ static int CiEqual(const char *a, const char *b)
         a++; b++;
     }
     return *a == *b;
+}
+
+/* Does this import DLL name forward to kernel32 (real name or API set)? */
+static int IsKernel32Like(const char *dllName)
+{
+    if (CiEqual(dllName, "kernel32.dll")) return 1;
+    /* API sets that forward kernel32 file/library/handle APIs. */
+    if (_strnicmp(dllName, "api-ms-win-core-", 15) == 0) return 1;
+    if (_strnicmp(dllName, "api-ms-win-crt-", 14) == 0) return 1;
+    return 0;
 }
 
 int WwIatHookModule(HMODULE module, const WW_IAT_HOOK *hooks, int nhooks)
@@ -47,14 +69,10 @@ int WwIatHookModule(HMODULE module, const WW_IAT_HOOK *hooks, int nhooks)
         PIMAGE_THUNK_DATA thunk;
         PIMAGE_THUNK_DATA orig;
         if (!imp->FirstThunk) continue;
-        /* Only patch imports from a DLL we have hooks for. */
-        {
-            int want = 0;
-            for (i = 0; i < nhooks; i++) {
-                if (CiEqual(dllName, hooks[i].dll)) { want = 1; break; }
-            }
-            if (!want) continue;
-        }
+        /* Only look at imports that could be kernel32 (real name or
+         * API set). This is just a fast pre-filter; the decisive match
+         * below is the resolved address / function name. */
+        if (!IsKernel32Like(dllName)) continue;
         thunk = (PIMAGE_THUNK_DATA)((BYTE *)module + imp->FirstThunk);
         orig = imp->OriginalFirstThunk
             ? (PIMAGE_THUNK_DATA)((BYTE *)module + imp->OriginalFirstThunk)
@@ -62,16 +80,26 @@ int WwIatHookModule(HMODULE module, const WW_IAT_HOOK *hooks, int nhooks)
         for (; orig->u1.AddressOfData; orig++, thunk++) {
             PIMAGE_IMPORT_BY_NAME byName;
             const char *funcName;
+            void *cur;
             if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
             byName = (PIMAGE_IMPORT_BY_NAME)((BYTE *)module + orig->u1.AddressOfData);
             funcName = (const char *)byName->Name;
+            cur = (void *)(ULONG_PTR)thunk->u1.Function;
             for (i = 0; i < nhooks; i++) {
-                if (!CiEqual(dllName, hooks[i].dll)) continue;
-                if (strcmp(funcName, hooks[i].func) != 0) continue;
+                int match = 0;
+                /* Primary: the IAT entry already resolves to the real
+                 * function address (pre-filled via GetProcAddress).
+                 * This catches API-set imports, whose DLL name is not
+                 * kernel32.dll but whose target is identical. */
+                if (*hooks[i].original && cur == *hooks[i].original) match = 1;
+                /* Fallback: name match (for hooks whose original was
+                 * never pre-filled). */
+                if (!match && strcmp(funcName, hooks[i].func) == 0) match = 1;
+                if (!match) continue;
                 if (!*hooks[i].original) {
-                    *hooks[i].original = (void *)(ULONG_PTR)thunk->u1.Function;
+                    *hooks[i].original = cur;
                 }
-                if ((void *)(ULONG_PTR)thunk->u1.Function != hooks[i].replacement) {
+                if (cur != hooks[i].replacement) {
                     DWORD oldProt;
                     if (VirtualProtect(&thunk->u1.Function, sizeof(void *),
                                        PAGE_READWRITE, &oldProt)) {
