@@ -374,7 +374,16 @@ static void WwEngOnCreate(HANDLE h, LPCWSTR lpFileName, DWORD dwDesiredAccess,
     DWORD read = 0;
     BOOL ok;
 
+    /* Re-entrancy guard for the probe handle: OnCreate opens a
+     * separate read handle via CreateFileW, which funnels back
+     * into the NtCreateFile hook and thus into OnCreate. The
+     * probe handle is only for reading the header and is closed
+     * immediately; it must not get a context and must not open
+     * yet another probe handle. */
+    static BOOL gWwInProbe = FALSE;
+
     (void)dwCreationDisposition;
+    if (gWwInProbe) return;
     if (!gPolicy) return;
     /* Idempotent: Win32 CreateFileW and NtCreateFile both funnel into
      * this for the same handle (CreateFileW calls NtCreateFile). A
@@ -397,86 +406,141 @@ static void WwEngOnCreate(HANDLE h, LPCWSTR lpFileName, DWORD dwDesiredAccess,
     }
     WwEngLog(2, "policy: MATCH exe=%ls file=%ls mode=%lu policy=%ls",
              exe, lpFileName, mode, policy_name);
-    /* Get the PHYSICAL file size, bypassing our own Query hook
-     * (it reports logical size = physical - 512). */
-    if (!NtGetFileSizeRaw(h, &fileSize.QuadPart)) return;
-    if (fileSize.QuadPart == 0) {
-        /* New (or truncated) file. Only WRITE mode creates a header. */
-        char asciiPolicy[WWFLT_MAX_GROUP_LEN];
-        DWORD written = 0;
-        LARGE_INTEGER zero;
-        if (mode != WWFLT_ENCRYPT_WRITE) return;
-        if (!(dwDesiredAccess & GENERIC_WRITE)) return;
-        WwEngRandomKey(key);
-        PolicyNameToAscii(policy_name, asciiPolicy, sizeof(asciiPolicy));
-        WwEngBuildHeader(hdr, asciiPolicy, key);
-        zero.QuadPart = 0;
-        gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
-        ok = gOrigWriteFile(h, hdr, WWFLT_HEADER_SIZE, &written, NULL);
-        if (!ok || written != WWFLT_HEADER_SIZE) {
-            WwEngLog(1, "create: header write failed for %ls", lpFileName);
-            return;
-        }
-        ctx = (WW_FILE_CTX *)calloc(1, sizeof(WW_FILE_CTX));
-        if (!ctx) return;
-        ctx->hFile = h;
-        ctx->is_encrypted = TRUE;
-        ctx->mode = mode;
-        ctx->version = WWFLT_CURRENT_VERSION;
-        wcscpy(ctx->policy_name, policy_name);
-        WwSboxInit(&ctx->sbox, ctx->version, key);
-        EnterCriticalSection(&gCtxLock);
-        WwEngInsertCtx(ctx);
-        LeaveCriticalSection(&gCtxLock);
-        /* Logical view: the caller sees position 0 = content start.
-         * The 512-byte header is transparent (the read/write hooks
-         * add 512). Seek back to 0, like the vendor does. */
-        gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
-        WwEngLog(2, "create: new encrypted %ls mode=%lu", lpFileName, mode);
-        return;
-    }
-    if (fileSize.QuadPart < WWFLT_HEADER_SIZE) {
-        /* Too small to carry a header: plaintext, no conversion. */
-        WwEngLog(2, "create: reopen %ls phys=%lld < 512, no ctx", lpFileName, fileSize.QuadPart);
-        return;
-    }
-    /* Existing file: probe the first 512 bytes for the magic. */
+    /* Size and header probe go through a SEPARATE clean read
+     * handle. The caller's handle may be memory-mapped (Notepad
+     * maps the file): its reported size then fluctuates (4096 =
+     * one mapped page vs the real size) and ReadFile on it fails
+     * outright (wweng-10.log: probe read=0 ok=0). A fresh read
+     * handle is not mapped and reads reliably. The caller's
+     * handle is only used to write a new header and to track
+     * the context. If the probe open fails (exclusive lock),
+     * fall back to the caller's handle (old behavior). */
     {
-        LARGE_INTEGER zero;
-        zero.QuadPart = 0;
-        gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
-        ok = gOrigReadFile(h, hdr, WWFLT_HEADER_SIZE, &read, NULL);
-        if (!ok || read != WWFLT_HEADER_SIZE) {
-            WwEngLog(2, "create: reopen %ls phys=%lld probe read=%lu ok=%d, no ctx", lpFileName, fileSize.QuadPart, read, ok ? 1 : 0);
+        HANDLE probe = INVALID_HANDLE_VALUE;
+        LARGE_INTEGER probeSize;
+        BOOL haveProbeSize = FALSE;
+        DWORD probeErr = 0;
+        if (gOrigCreateFileW) {
+            /* The probe open re-enters OnCreate via the hooked
+             * NtCreateFile; gWwInProbe makes that call a no-op. */
+            gWwInProbe = TRUE;
+            probe = gOrigCreateFileW(lpFileName, GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            gWwInProbe = FALSE;
+            if (probe == INVALID_HANDLE_VALUE) probeErr = GetLastError();
+        }
+        if (probe != INVALID_HANDLE_VALUE) {
+            if (gOrigGetFileSizeEx(probe, &probeSize)) {
+                haveProbeSize = TRUE;
+                fileSize = probeSize;
+            } else {
+                WwEngLog(2, "create: reopen %ls probe size failed err=%lu", lpFileName, GetLastError());
+                gOrigCloseHandle(probe);
+                probe = INVALID_HANDLE_VALUE;
+            }
+        }
+        if (!haveProbeSize) {
+            /* Fallback: physical size from the caller's handle,
+             * bypassing our own Query hook (it reports logical
+             * size = physical - 512). */
+            if (!NtGetFileSizeRaw(h, &fileSize.QuadPart)) {
+                if (probe != INVALID_HANDLE_VALUE) gOrigCloseHandle(probe);
+                return;
+            }
+            WwEngLog(2, "create: reopen %ls probe open failed err=%lu, fallback to handle size=%lld", lpFileName, probeErr, fileSize.QuadPart);
+        }
+        if (fileSize.QuadPart == 0) {
+            /* New (or truncated) file. Only WRITE mode creates a header. */
+            char asciiPolicy[WWFLT_MAX_GROUP_LEN];
+            DWORD written = 0;
+            LARGE_INTEGER zero;
+            if (probe != INVALID_HANDLE_VALUE) gOrigCloseHandle(probe);
+            if (mode != WWFLT_ENCRYPT_WRITE) return;
+            if (!(dwDesiredAccess & GENERIC_WRITE)) return;
+            WwEngRandomKey(key);
+            PolicyNameToAscii(policy_name, asciiPolicy, sizeof(asciiPolicy));
+            WwEngBuildHeader(hdr, asciiPolicy, key);
+            zero.QuadPart = 0;
             gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
+            ok = gOrigWriteFile(h, hdr, WWFLT_HEADER_SIZE, &written, NULL);
+            if (!ok || written != WWFLT_HEADER_SIZE) {
+                WwEngLog(1, "create: header write failed for %ls", lpFileName);
+                return;
+            }
+            ctx = (WW_FILE_CTX *)calloc(1, sizeof(WW_FILE_CTX));
+            if (!ctx) return;
+            ctx->hFile = h;
+            ctx->is_encrypted = TRUE;
+            ctx->mode = mode;
+            ctx->version = WWFLT_CURRENT_VERSION;
+            wcscpy(ctx->policy_name, policy_name);
+            WwSboxInit(&ctx->sbox, ctx->version, key);
+            EnterCriticalSection(&gCtxLock);
+            WwEngInsertCtx(ctx);
+            LeaveCriticalSection(&gCtxLock);
+            /* Logical view: the caller sees position 0 = content start.
+             * The 512-byte header is transparent (the read/write hooks
+             * add 512). Seek back to 0, like the vendor does. */
+            gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
+            WwEngLog(2, "create: new encrypted %ls mode=%lu", lpFileName, mode);
             return;
         }
-        if (!WwEngParseHeader(hdr, key, &version)) {
-            /* Not an encrypted file: restore position to 0 and pass through. */
-            WwEngLog(2, "create: reopen %ls phys=%lld magic mismatch, no ctx", lpFileName, fileSize.QuadPart);
-            gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
+        if (fileSize.QuadPart < WWFLT_HEADER_SIZE) {
+            /* Too small to carry a header: plaintext, no conversion. */
+            WwEngLog(2, "create: reopen %ls phys=%lld < 512, no ctx", lpFileName, fileSize.QuadPart);
+            if (probe != INVALID_HANDLE_VALUE) gOrigCloseHandle(probe);
             return;
         }
-        /* Encrypted: seek back to 0. The caller sees a logical view
-         * (position 0 = content start); the read/write hooks add 512
-         * to reach the physical data. This matches the vendor. */
-        gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
-        ctx = (WW_FILE_CTX *)calloc(1, sizeof(WW_FILE_CTX));
-        if (!ctx) {
+        /* Existing file: probe the first 512 bytes for the magic. */
+        {
+            LARGE_INTEGER zero;
+            zero.QuadPart = 0;
+            if (probe != INVALID_HANDLE_VALUE) {
+                ok = gOrigReadFile(probe, hdr, WWFLT_HEADER_SIZE, &read, NULL);
+                gOrigCloseHandle(probe);
+                probe = INVALID_HANDLE_VALUE;
+                if (!ok || read != WWFLT_HEADER_SIZE) {
+                    WwEngLog(2, "create: reopen %ls phys=%lld probe read=%lu ok=%d err=%lu, no ctx", lpFileName, fileSize.QuadPart, read, ok ? 1 : 0, GetLastError());
+                    gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
+                    return;
+                }
+            } else {
+                gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
+                ok = gOrigReadFile(h, hdr, WWFLT_HEADER_SIZE, &read, NULL);
+                if (!ok || read != WWFLT_HEADER_SIZE) {
+                    WwEngLog(2, "create: reopen %ls phys=%lld probe read=%lu ok=%d err=%lu, no ctx", lpFileName, fileSize.QuadPart, read, ok ? 1 : 0, GetLastError());
+                    gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
+                    return;
+                }
+            }
+            if (!WwEngParseHeader(hdr, key, &version)) {
+                /* Not an encrypted file: restore position to 0 and pass through. */
+                WwEngLog(2, "create: reopen %ls phys=%lld magic mismatch, no ctx", lpFileName, fileSize.QuadPart);
+                gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
+                return;
+            }
+            /* Encrypted: seek back to 0. The caller sees a logical view
+             * (position 0 = content start); the read/write hooks add 512
+             * to reach the physical data. This matches the vendor. */
             gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
-            return;
+            ctx = (WW_FILE_CTX *)calloc(1, sizeof(WW_FILE_CTX));
+            if (!ctx) {
+                gOrigSetFilePointerEx(h, zero, NULL, FILE_BEGIN);
+                return;
+            }
+            ctx->hFile = h;
+            ctx->is_encrypted = TRUE;
+            ctx->mode = mode;
+            ctx->version = version;
+            wcscpy(ctx->policy_name, policy_name);
+            WwSboxInit(&ctx->sbox, version, key);
+            EnterCriticalSection(&gCtxLock);
+            WwEngInsertCtx(ctx);
+            LeaveCriticalSection(&gCtxLock);
+            WwEngLog(2, "create: opened encrypted %ls version=%d mode=%lu",
+                     lpFileName, version, mode);
         }
-        ctx->hFile = h;
-        ctx->is_encrypted = TRUE;
-        ctx->mode = mode;
-        ctx->version = version;
-        wcscpy(ctx->policy_name, policy_name);
-        WwSboxInit(&ctx->sbox, version, key);
-        EnterCriticalSection(&gCtxLock);
-        WwEngInsertCtx(ctx);
-        LeaveCriticalSection(&gCtxLock);
-        WwEngLog(2, "create: opened encrypted %ls version=%d mode=%lu",
-                 lpFileName, version, mode);
     }
 }
 
