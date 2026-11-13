@@ -415,8 +415,11 @@ typedef struct {
 
 typedef struct {
     const WwMenuVtbl *lpVtbl;       /* IContextMenu, offset 0 (primary) */
-    const WwInitVtbl *lpVtblInit;   /* IShellExtInit, offset sizeof(void*) */
-    LONG ref;
+    LONG ref;                       /* offset 8 -- must stay right after
+                                     * lpVtbl so WwComAddRef/Release (which
+                                     * assume ref is at offset 8) hit the
+                                     * real refcount, not lpVtblInit. */
+    const WwInitVtbl *lpVtblInit;   /* IShellExtInit, offset 16 */
     int nfiles;
     WCHAR files[WW_MAX_FILES][MAX_PATH];
     /* command offsets assigned in QueryContextMenu (relative to idCmdFirst) */
