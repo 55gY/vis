@@ -437,6 +437,12 @@ static HRESULT STDMETHODCALLTYPE Menu_QueryInterface(void *self, REFIID riid, vo
         InterlockedIncrement(&o->ref);
         return S_OK;
     }
+    if (IsEqualIID(riid, &IID_IShellExtInit)) {
+        /* IShellExtInit lives at offsetof(WwShellMenu, lpVtblInit). */
+        *ppv = (void *)&o->lpVtblInit;
+        InterlockedIncrement(&o->ref);
+        return S_OK;
+    }
     return E_NOINTERFACE;
 }
 
@@ -788,16 +794,21 @@ HRESULT WINAPI DllRegisterServer(void)
     hr = WwRegisterClass(&CLSID_WWShellMenu, L"WWShellMenu Class",
                        L"WWShell.WWShellMenu.1");
     if (FAILED(hr)) return hr;
-    /* Overlay identifier (name sorts to the front). */
-    GuidString(&CLSID_WWShellIcon, guid, 40);
-    if (!RegSetStr(HKEY_LOCAL_MACHINE,
-                   L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellIconOverlayIdentifiers",
-                   WW_OVERLAY_NAME, guid)) {
-        /* Fall back to the per-user location if HKLM is not writable. */
-        if (!RegSetStr(HKEY_CURRENT_USER,
-                       L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellIconOverlayIdentifiers",
-                       WW_OVERLAY_NAME, guid))
-            return E_FAIL;
+    /* Overlay identifier: a SUBKEY named '          WWShellIcon' under
+     * ShellIconOverlayIdentifiers, whose default value is the CLSID.
+     * (Explorer enumerates subkeys, not values -- writing it as a value
+     * is silently ignored, which is why the icon never appeared.) */
+    {
+        WCHAR overlayKey[MAX_PATH];
+        swprintf(overlayKey, MAX_PATH,
+                 L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellIconOverlayIdentifiers\\%s",
+                 WW_OVERLAY_NAME);
+        GuidString(&CLSID_WWShellIcon, guid, 40);
+        if (!RegSetStr(HKEY_LOCAL_MACHINE, overlayKey, NULL, guid)) {
+            /* Fall back to the per-user location if HKLM is not writable. */
+            if (!RegSetStr(HKEY_CURRENT_USER, overlayKey, NULL, guid))
+                return E_FAIL;
+        }
     }
     /* Context menu handler for all files. */
     GuidString(&CLSID_WWShellMenu, guid, 40);
