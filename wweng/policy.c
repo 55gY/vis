@@ -155,10 +155,19 @@ void WwEngBuildHeader(UCHAR hdr[WWFLT_HEADER_SIZE], const char *policy_name,
     }
     memcpy(hdr + WWFLT_HEADER_POLICY_OFF, policy_name, pn_len);
     memcpy(hdr + WWFLT_HEADER_KEY_OFF, key, WWFLT_KEY_SIZE);
-    /* Encrypt header bytes +0x12..0x1ff with counter starting at 0. */
+    /* Encrypt header bytes +0x12..0x30 and +0x50..0x1ff, counter =
+     * offset-0x12. The key at +0x30..0x4f is stored in PLAINTEXT and
+     * skipped -- verified byte-identical against the vendor's 1.txt
+     * (re-encrypting a decrypted vendor header reproduces the raw
+     * file only when the key is left plaintext). Encrypting the key
+     * region (the old code did) makes our files unreadable by the
+     * vendor client and garbles the policy name. */
     WwSboxInit(&tmp, WWFLT_CURRENT_VERSION, key);
     WwSboxEncrypt(&tmp, hdr + WWFLT_HEADER_POLICY_OFF,
-                  WWFLT_HEADER_SIZE - WWFLT_HEADER_POLICY_OFF, 0);
+                  WWFLT_HEADER_KEY_OFF - WWFLT_HEADER_POLICY_OFF, 0);
+    WwSboxEncrypt(&tmp, hdr + WWFLT_HEADER_KEY_OFF + WWFLT_KEY_SIZE,
+                  WWFLT_HEADER_SIZE - (WWFLT_HEADER_KEY_OFF + WWFLT_KEY_SIZE),
+                  WWFLT_HEADER_KEY_OFF + WWFLT_KEY_SIZE - WWFLT_HEADER_POLICY_OFF);
     (void)i;
 }
 
@@ -169,10 +178,16 @@ BOOL WwEngParseHeader(UCHAR hdr[WWFLT_HEADER_SIZE], UCHAR key[WWFLT_KEY_SIZE],
     if (memcmp(hdr, gMagic, WWFLT_MAGIC_SIZE) != 0) return FALSE;
     *version = hdr[WWFLT_HEADER_VERSION_OFF] | (hdr[WWFLT_HEADER_VERSION_OFF + 1] << 8);
     if (*version != WWFLT_VERSION_1 && *version != WWFLT_VERSION_2) return FALSE;
+    /* The key is stored in PLAINTEXT; read it before decrypting. */
     memcpy(key, hdr + WWFLT_HEADER_KEY_OFF, WWFLT_KEY_SIZE);
     WwSboxInit(&tmp, *version, key);
+    /* Decrypt +0x12..0x30 and +0x50..0x1ff, counter = offset-0x12.
+     * The key region stays as-is (it is plaintext, not ciphertext). */
     WwSboxDecrypt(&tmp, hdr + WWFLT_HEADER_POLICY_OFF,
-                  WWFLT_HEADER_SIZE - WWFLT_HEADER_POLICY_OFF, 0);
+                  WWFLT_HEADER_KEY_OFF - WWFLT_HEADER_POLICY_OFF, 0);
+    WwSboxDecrypt(&tmp, hdr + WWFLT_HEADER_KEY_OFF + WWFLT_KEY_SIZE,
+                  WWFLT_HEADER_SIZE - (WWFLT_HEADER_KEY_OFF + WWFLT_KEY_SIZE),
+                  WWFLT_HEADER_KEY_OFF + WWFLT_KEY_SIZE - WWFLT_HEADER_POLICY_OFF);
     return TRUE;
 }
 

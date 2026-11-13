@@ -46,6 +46,110 @@ static DWORD (WINAPI *gOrigGetFileSize)(HANDLE, LPDWORD) = NULL;
 static BOOL (WINAPI *gOrigGetFileSizeEx)(HANDLE, PLARGE_INTEGER) = NULL;
 static BOOL (WINAPI *gOrigSetEndOfFile)(HANDLE) = NULL;
 
+/* ---- NT layer (ntdll.dll) ----
+ * The vendor hooks Nt* (not Win32): Notepad reads via NtReadFile and
+ * memory mapping, which bypass a Win32-only ReadFile hook. These
+ * Detours hooks share the same context list / policy evaluation as
+ * the Win32 hooks. Async I/O (Event/ApcRoutine set) passes through,
+ * like overlapped I/O in the Win32 hooks. */
+typedef LONG NTSTATUS;
+#define WW_NT_SUCCESS(s) ((NTSTATUS)(s) >= 0)
+typedef struct _WW_IO_STATUS_BLOCK {
+    union { NTSTATUS Status; PVOID Pointer; };
+    ULONG_PTR Information;
+} WW_IO_STATUS_BLOCK, *PWW_IO_STATUS_BLOCK;
+typedef struct _WW_UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR Buffer;
+} WW_UNICODE_STRING, *PWW_UNICODE_STRING;
+typedef struct _WW_OBJECT_ATTRIBUTES {
+    ULONG Length;
+    HANDLE RootDirectory;
+    PWW_UNICODE_STRING ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+} WW_OBJECT_ATTRIBUTES, *PWW_OBJECT_ATTRIBUTES;
+typedef struct _WW_FILE_POSITION_INFORMATION {
+    LARGE_INTEGER CurrentByteOffset;
+} WW_FILE_POSITION_INFORMATION;
+typedef struct _WW_FILE_END_OF_FILE_INFORMATION {
+    LARGE_INTEGER EndOfFile;
+} WW_FILE_END_OF_FILE_INFORMATION;
+typedef struct _WW_FILE_STANDARD_INFORMATION {
+    LARGE_INTEGER AllocationSize;
+    LARGE_INTEGER EndOfFile;
+    ULONG NumberOfLinks;
+    BOOLEAN DeletePending;
+    BOOLEAN Directory;
+} WW_FILE_STANDARD_INFORMATION;
+typedef enum _WW_FILE_INFORMATION_CLASS {
+    WW_FileStandardInformation = 5,
+    WW_FilePositionInformation = 14,
+    WW_FileEndOfFileInformation = 20
+} WW_FILE_INFORMATION_CLASS;
+
+typedef NTSTATUS (NTAPI *NtCreateFile_t)(PHANDLE, ACCESS_MASK, PWW_OBJECT_ATTRIBUTES, PWW_IO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+typedef NTSTATUS (NTAPI *NtOpenFile_t)(PHANDLE, ACCESS_MASK, PWW_OBJECT_ATTRIBUTES, PWW_IO_STATUS_BLOCK, ULONG, ULONG);
+typedef NTSTATUS (NTAPI *NtReadFile_t)(HANDLE, HANDLE, PVOID, PVOID, PWW_IO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+typedef NTSTATUS (NTAPI *NtWriteFile_t)(HANDLE, HANDLE, PVOID, PVOID, PWW_IO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+typedef NTSTATUS (NTAPI *NtClose_t)(HANDLE);
+typedef NTSTATUS (NTAPI *NtSetInformationFile_t)(HANDLE, PWW_IO_STATUS_BLOCK, PVOID, ULONG, WW_FILE_INFORMATION_CLASS);
+typedef NTSTATUS (NTAPI *NtQueryInformationFile_t)(HANDLE, PWW_IO_STATUS_BLOCK, PVOID, ULONG, WW_FILE_INFORMATION_CLASS);
+
+static NtCreateFile_t gOrigNtCreateFile = NULL;
+static NtOpenFile_t gOrigNtOpenFile = NULL;
+static NtReadFile_t gOrigNtReadFile = NULL;
+static NtWriteFile_t gOrigNtWriteFile = NULL;
+static NtClose_t gOrigNtClose = NULL;
+static NtSetInformationFile_t gOrigNtSetInformationFile = NULL;
+static NtQueryInformationFile_t gOrigNtQueryInformationFile = NULL;
+
+/* Convert an NT path (\??\C:\... or \DosDevices\C:\...) to a Win32
+ * path (C:\...). Returns FALSE if it is not a Win32-style path. */
+static BOOL NtPathToWin32(PWW_UNICODE_STRING name, WCHAR *out, size_t chars)
+{
+    const WCHAR *p;
+    size_t len;
+    if (!name || !name->Buffer || name->Length == 0) return FALSE;
+    p = name->Buffer;
+    len = name->Length / sizeof(WCHAR);
+    if (len >= 4 && p[0] == L'\\' && p[1] == L'?' && p[2] == L'?' && p[3] == L'\\') {
+        p += 4; len -= 4;
+        /* \??\UNC\server\share -> \\server\share */
+        if (len >= 4 && (p[0] == L'U' || p[0] == L'u') && (p[1] == L'N' || p[1] == L'n') &&
+            (p[2] == L'C' || p[2] == L'c') && p[3] == L'\\') {
+            if (chars < len - 2) return FALSE;
+            out[0] = L'\\'; out[1] = L'\\';
+            wcsncpy(out + 2, p + 4, chars - 3);
+            out[chars - 1] = L'\0';
+            return TRUE;
+        }
+    } else if (len >= 13 && _wcsnicmp(p, L"\\DosDevices\\", 12) == 0) {
+        p += 12; len -= 12;
+    } else {
+        return FALSE;
+    }
+    if (len >= chars) return FALSE;
+    wcsncpy(out, p, chars - 1);
+    out[chars - 1] = L'\0';
+    return TRUE;
+}
+
+/* Current physical file position via the original NtQueryInformationFile. */
+static BOOL NtGetPosition(HANDLE h, LONGLONG *pos)
+{
+    WW_IO_STATUS_BLOCK iosb;
+    WW_FILE_POSITION_INFORMATION pi;
+    NTSTATUS st;
+    if (!gOrigNtQueryInformationFile) return FALSE;
+    st = gOrigNtQueryInformationFile(h, &iosb, &pi, sizeof(pi), WW_FilePositionInformation);
+    if (!WW_NT_SUCCESS(st)) return FALSE;
+    *pos = pi.CurrentByteOffset.QuadPart;
+    return TRUE;
+}
+
 /* ---- globals ---- */
 static HMODULE gOwnModule = NULL;
 static CRITICAL_SECTION gCtxLock;
@@ -236,6 +340,10 @@ static void WwEngOnCreate(HANDLE h, LPCWSTR lpFileName, DWORD dwDesiredAccess,
 
     (void)dwCreationDisposition;
     if (!gPolicy) return;
+    /* Idempotent: Win32 CreateFileW and NtCreateFile both funnel into
+     * this for the same handle (CreateFileW calls NtCreateFile). A
+     * second call for an already-tracked handle is a no-op. */
+    if (WwEngFindCtx(h)) return;
     /* Only regular files the app can read/write matter. Directories and
      * non-disk handles are skipped by checking the file type. */
     if (GetFileType(h) != FILE_TYPE_DISK) return;
@@ -614,6 +722,203 @@ static BOOL WINAPI WwHookSetEndOfFile(HANDLE hFile)
     return ok;
 }
 
+/* ---- NT hooks (ntdll.dll) ----
+ * Same policy/context as the Win32 hooks; the data path is identical
+ * except the offset comes from ByteOffset (or the current position
+ * when it is NULL) and completion is reported via IO_STATUS_BLOCK. */
+static NTSTATUS NTAPI WwHookNtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+    PWW_OBJECT_ATTRIBUTES ObjectAttributes, PWW_IO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
+    ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength)
+{
+    NTSTATUS st;
+    WCHAR win32path[MAX_PATH];
+    st = gOrigNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
+                           AllocationSize, FileAttributes, ShareAccess, CreateDisposition,
+                           CreateOptions, EaBuffer, EaLength);
+    if (!WW_NT_SUCCESS(st) || !FileHandle || *FileHandle == INVALID_HANDLE_VALUE) return st;
+    if (!NtPathToWin32(ObjectAttributes ? ObjectAttributes->ObjectName : NULL, win32path, MAX_PATH)) return st;
+    /* Diagnostic: log every .txt open so we can see whether the hook
+     * fires at all. (The Win32 CreateFileW hook is gone -- it would
+     * double-decrypt with NtReadFile -- so NtCreateFile is the log
+     * point now.) */
+    {
+        size_t n = wcslen(win32path);
+        if (n >= 4 && _wcsicmp(win32path + n - 4, L".txt") == 0) {
+            WwEngLog(2, "hook: NtCreateFile %ls access=0x%lx", win32path, DesiredAccess);
+        }
+    }
+    EnterCriticalSection(&gCtxLock);
+    WwEngOnCreate(*FileHandle, win32path, DesiredAccess, 0);
+    LeaveCriticalSection(&gCtxLock);
+    return st;
+}
+
+static NTSTATUS NTAPI WwHookNtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+    PWW_OBJECT_ATTRIBUTES ObjectAttributes, PWW_IO_STATUS_BLOCK IoStatusBlock,
+    ULONG ShareAccess, ULONG OpenOptions)
+{
+    NTSTATUS st;
+    WCHAR win32path[MAX_PATH];
+    st = gOrigNtOpenFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
+                         ShareAccess, OpenOptions);
+    if (!WW_NT_SUCCESS(st) || !FileHandle || *FileHandle == INVALID_HANDLE_VALUE) return st;
+    if (!NtPathToWin32(ObjectAttributes ? ObjectAttributes->ObjectName : NULL, win32path, MAX_PATH)) return st;
+    EnterCriticalSection(&gCtxLock);
+    WwEngOnCreate(*FileHandle, win32path, DesiredAccess, 0);
+    LeaveCriticalSection(&gCtxLock);
+    return st;
+}
+
+static NTSTATUS NTAPI WwHookNtReadFile(HANDLE FileHandle, HANDLE Event,
+    PVOID ApcRoutine, PVOID ApcContext, PWW_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key)
+{
+    WW_FILE_CTX *ctx;
+    NTSTATUS st;
+    LONGLONG phys_off;
+    ULONGLONG logical_off;
+    ULONG read = 0;
+
+    /* Async I/O passes through, like overlapped I/O in Win32. */
+    if (Event || ApcRoutine) {
+        return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                               Buffer, Length, ByteOffset, Key);
+    }
+    EnterCriticalSection(&gCtxLock);
+    ctx = WwEngFindCtx(FileHandle);
+    if (!ctx || !ctx->is_encrypted) {
+        LeaveCriticalSection(&gCtxLock);
+        return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                               Buffer, Length, ByteOffset, Key);
+    }
+    if (ByteOffset) {
+        phys_off = ByteOffset->QuadPart;
+    } else if (!NtGetPosition(FileHandle, &phys_off)) {
+        LeaveCriticalSection(&gCtxLock);
+        return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                               Buffer, Length, ByteOffset, Key);
+    }
+    if (phys_off < WWFLT_HEADER_SIZE) {
+        /* Header read: pass through undecrypted. */
+        LeaveCriticalSection(&gCtxLock);
+        return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                               Buffer, Length, ByteOffset, Key);
+    }
+    logical_off = (ULONGLONG)(phys_off - WWFLT_HEADER_SIZE);
+    st = gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                         Buffer, Length, ByteOffset, Key);
+    if (WW_NT_SUCCESS(st) && IoStatusBlock && IoStatusBlock->Information > 0) {
+        read = (ULONG)IoStatusBlock->Information;
+        WwSboxDecrypt(&ctx->sbox, (unsigned char *)Buffer, read, logical_off);
+    }
+    LeaveCriticalSection(&gCtxLock);
+    return st;
+}
+
+static NTSTATUS NTAPI WwHookNtWriteFile(HANDLE FileHandle, HANDLE Event,
+    PVOID ApcRoutine, PVOID ApcContext, PWW_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key)
+{
+    WW_FILE_CTX *ctx;
+    NTSTATUS st;
+    LONGLONG phys_off;
+    ULONGLONG logical_off;
+    unsigned char *tmp = NULL;
+
+    if (Event || ApcRoutine) {
+        return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                Buffer, Length, ByteOffset, Key);
+    }
+    EnterCriticalSection(&gCtxLock);
+    ctx = WwEngFindCtx(FileHandle);
+    if (!ctx || !ctx->is_encrypted || ctx->mode != WWFLT_ENCRYPT_WRITE) {
+        LeaveCriticalSection(&gCtxLock);
+        return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                Buffer, Length, ByteOffset, Key);
+    }
+    if (ByteOffset) {
+        phys_off = ByteOffset->QuadPart;
+    } else if (!NtGetPosition(FileHandle, &phys_off)) {
+        LeaveCriticalSection(&gCtxLock);
+        return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                Buffer, Length, ByteOffset, Key);
+    }
+    if (phys_off < WWFLT_HEADER_SIZE) {
+        LeaveCriticalSection(&gCtxLock);
+        return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                Buffer, Length, ByteOffset, Key);
+    }
+    logical_off = (ULONGLONG)(phys_off - WWFLT_HEADER_SIZE);
+    tmp = (unsigned char *)malloc(Length ? Length : 1);
+    if (!tmp) {
+        LeaveCriticalSection(&gCtxLock);
+        if (IoStatusBlock) { IoStatusBlock->Status = 0xC0000017; IoStatusBlock->Information = 0; }
+        return 0xC0000017; /* STATUS_NO_MEMORY */
+    }
+    memcpy(tmp, Buffer, Length);
+    WwSboxEncrypt(&ctx->sbox, tmp, Length, logical_off);
+    st = gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                          tmp, Length, ByteOffset, Key);
+    free(tmp);
+    LeaveCriticalSection(&gCtxLock);
+    return st;
+}
+
+static NTSTATUS NTAPI WwHookNtClose(HANDLE Handle)
+{
+    EnterCriticalSection(&gCtxLock);
+    WwEngRemoveCtx(Handle);
+    LeaveCriticalSection(&gCtxLock);
+    return gOrigNtClose(Handle);
+}
+
+static NTSTATUS NTAPI WwHookNtSetInformationFile(HANDLE FileHandle,
+    PWW_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    WW_FILE_INFORMATION_CLASS FileInformationClass)
+{
+    /* Position and end-of-file are physical offsets already including
+     * the header; pass through. Size translation is done in Query. */
+    return gOrigNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                     Length, FileInformationClass);
+}
+
+static NTSTATUS NTAPI WwHookNtQueryInformationFile(HANDLE FileHandle,
+    PWW_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    WW_FILE_INFORMATION_CLASS FileInformationClass)
+{
+    NTSTATUS st;
+    WW_FILE_CTX *ctx;
+    st = gOrigNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                     Length, FileInformationClass);
+    if (!WW_NT_SUCCESS(st)) return st;
+    EnterCriticalSection(&gCtxLock);
+    ctx = WwEngFindCtx(FileHandle);
+    if (!ctx || !ctx->is_encrypted) {
+        LeaveCriticalSection(&gCtxLock);
+        return st;
+    }
+    /* Report the LOGICAL size (physical - 512) so callers see the
+     * plaintext length. */
+    if (FileInformationClass == WW_FileStandardInformation && Length >= sizeof(WW_FILE_STANDARD_INFORMATION)) {
+        WW_FILE_STANDARD_INFORMATION *si = (WW_FILE_STANDARD_INFORMATION *)FileInformation;
+        if (si->EndOfFile.QuadPart >= WWFLT_HEADER_SIZE)
+            si->EndOfFile.QuadPart -= WWFLT_HEADER_SIZE;
+        else
+            si->EndOfFile.QuadPart = 0;
+        if (si->AllocationSize.QuadPart >= WWFLT_HEADER_SIZE)
+            si->AllocationSize.QuadPart -= WWFLT_HEADER_SIZE;
+    } else if (FileInformationClass == WW_FileEndOfFileInformation && Length >= sizeof(WW_FILE_END_OF_FILE_INFORMATION)) {
+        WW_FILE_END_OF_FILE_INFORMATION *ei = (WW_FILE_END_OF_FILE_INFORMATION *)FileInformation;
+        if (ei->EndOfFile.QuadPart >= WWFLT_HEADER_SIZE)
+            ei->EndOfFile.QuadPart -= WWFLT_HEADER_SIZE;
+        else
+            ei->EndOfFile.QuadPart = 0;
+    }
+    LeaveCriticalSection(&gCtxLock);
+    return st;
+}
+
 /* ---- Detours install ----
  * Patches the function bodies in kernelbase.dll (via kernel32's
  * GetProcAddress, which resolves to the same addresses). DetourAttach
@@ -622,47 +927,95 @@ static BOOL WINAPI WwHookSetEndOfFile(HANDLE hFile)
  * No LoadLibrary hook: a function-body patch is process-wide, so
  * modules loaded later call the same patched body automatically.
  * Returns the number of hooks successfully attached. */
+/* Attach one hook; record ok/fail in the per-hook status string.
+ * `dst` is the address of a gOrig* slot (DetourAttach rewrites it to
+ * the trampoline). Returns 1 on success. */
+#define WW_ATTACH(dst, hookfn, tag, statusbuf, off) do { \
+    LONG _e = NO_ERROR; \
+    if (*(dst)) { _e = DetourAttach((PVOID*)(dst), (hookfn)); } \
+    if (_e == NO_ERROR && *(dst)) { \
+        (statusbuf)[off] = '1'; \
+    } else { \
+        (statusbuf)[off] = '0'; \
+        WwEngLog(1, "attach: %s FAILED err=%ld", (tag), (long)_e); \
+    } \
+} while (0)
+
 static int WwDetoursInstall(void)
 {
-    HMODULE k32;
+    HMODULE ntdll;
     LONG err;
     int n = 0;
+    /* Per-hook status, one char per hook in attach order; logged in
+     * DllMain so a failed Attach is visible instead of hidden in a
+     * total. Order: NtCreateFile, NtOpenFile, NtReadFile, NtWriteFile,
+     * NtClose, NtSetInformationFile, NtQueryInformationFile. */
+    static char gAttachStatus[8] = "???????";
 
-    k32 = GetModuleHandleW(L"kernel32.dll");
-    if (!k32) return 0;
-    /* Resolve the real addresses first (DetourAttach needs them in
-     * the gOrig* slots). */
-    if (!gOrigCreateFileW) gOrigCreateFileW = (void *)GetProcAddress(k32, "CreateFileW");
-    if (!gOrigCreateFileA) gOrigCreateFileA = (void *)GetProcAddress(k32, "CreateFileA");
-    if (!gOrigReadFile) gOrigReadFile = (void *)GetProcAddress(k32, "ReadFile");
-    if (!gOrigWriteFile) gOrigWriteFile = (void *)GetProcAddress(k32, "WriteFile");
-    if (!gOrigCloseHandle) gOrigCloseHandle = (void *)GetProcAddress(k32, "CloseHandle");
-    if (!gOrigSetFilePointer) gOrigSetFilePointer = (void *)GetProcAddress(k32, "SetFilePointer");
-    if (!gOrigSetFilePointerEx) gOrigSetFilePointerEx = (void *)GetProcAddress(k32, "SetFilePointerEx");
-    if (!gOrigGetFileSize) gOrigGetFileSize = (void *)GetProcAddress(k32, "GetFileSize");
-    if (!gOrigGetFileSizeEx) gOrigGetFileSizeEx = (void *)GetProcAddress(k32, "GetFileSizeEx");
-    if (!gOrigSetEndOfFile) gOrigSetEndOfFile = (void *)GetProcAddress(k32, "SetEndOfFile");
+    /* Win32 originals are resolved for INTERNAL use only
+     * (WwEngOnCreate reads/writes the header and queries the size
+     * through them). The Win32 hooks are NOT attached -- the data
+     * path goes through NtReadFile/NtWriteFile only, so nothing is
+     * decrypted or size-translated twice. */
+    {
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        if (k32) {
+            if (!gOrigCreateFileW) gOrigCreateFileW = (void *)GetProcAddress(k32, "CreateFileW");
+            if (!gOrigCreateFileA) gOrigCreateFileA = (void *)GetProcAddress(k32, "CreateFileA");
+            if (!gOrigReadFile) gOrigReadFile = (void *)GetProcAddress(k32, "ReadFile");
+            if (!gOrigWriteFile) gOrigWriteFile = (void *)GetProcAddress(k32, "WriteFile");
+            if (!gOrigCloseHandle) gOrigCloseHandle = (void *)GetProcAddress(k32, "CloseHandle");
+            if (!gOrigSetFilePointer) gOrigSetFilePointer = (void *)GetProcAddress(k32, "SetFilePointer");
+            if (!gOrigSetFilePointerEx) gOrigSetFilePointerEx = (void *)GetProcAddress(k32, "SetFilePointerEx");
+            if (!gOrigGetFileSize) gOrigGetFileSize = (void *)GetProcAddress(k32, "GetFileSize");
+            if (!gOrigGetFileSizeEx) gOrigGetFileSizeEx = (void *)GetProcAddress(k32, "GetFileSizeEx");
+            if (!gOrigSetEndOfFile) gOrigSetEndOfFile = (void *)GetProcAddress(k32, "SetEndOfFile");
+        }
+    }
+    /* NT layer only. The Win32 hooks are NOT attached: Win32
+     * ReadFile/WriteFile/CreateFileW call NtReadFile/NtWriteFile/
+     * NtCreateFile internally, so hooking both layers would decrypt
+     * twice (and translate the size twice). The vendor hooks Nt*
+     * only, for the same reason. The Win32 hook functions stay in
+     * the source (unused) for reference. */
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll) {
+        if (!gOrigNtCreateFile) gOrigNtCreateFile = (NtCreateFile_t)GetProcAddress(ntdll, "NtCreateFile");
+        if (!gOrigNtOpenFile) gOrigNtOpenFile = (NtOpenFile_t)GetProcAddress(ntdll, "NtOpenFile");
+        if (!gOrigNtReadFile) gOrigNtReadFile = (NtReadFile_t)GetProcAddress(ntdll, "NtReadFile");
+        if (!gOrigNtWriteFile) gOrigNtWriteFile = (NtWriteFile_t)GetProcAddress(ntdll, "NtWriteFile");
+        if (!gOrigNtClose) gOrigNtClose = (NtClose_t)GetProcAddress(ntdll, "NtClose");
+        if (!gOrigNtSetInformationFile) gOrigNtSetInformationFile = (NtSetInformationFile_t)GetProcAddress(ntdll, "NtSetInformationFile");
+        if (!gOrigNtQueryInformationFile) gOrigNtQueryInformationFile = (NtQueryInformationFile_t)GetProcAddress(ntdll, "NtQueryInformationFile");
+    }
 
     err = DetourTransactionBegin();
     if (err != NO_ERROR) return 0;
     DetourUpdateThread(GetCurrentThread());
-    if (gOrigCreateFileW) { err = DetourAttach((PVOID*)&gOrigCreateFileW, WwHookCreateFileW); if (err == NO_ERROR) n++; }
-    if (gOrigCreateFileA) { err = DetourAttach((PVOID*)&gOrigCreateFileA, WwHookCreateFileA); if (err == NO_ERROR) n++; }
-    if (gOrigReadFile) { err = DetourAttach((PVOID*)&gOrigReadFile, WwHookReadFile); if (err == NO_ERROR) n++; }
-    if (gOrigWriteFile) { err = DetourAttach((PVOID*)&gOrigWriteFile, WwHookWriteFile); if (err == NO_ERROR) n++; }
-    if (gOrigCloseHandle) { err = DetourAttach((PVOID*)&gOrigCloseHandle, WwHookCloseHandle); if (err == NO_ERROR) n++; }
-    if (gOrigSetFilePointer) { err = DetourAttach((PVOID*)&gOrigSetFilePointer, WwHookSetFilePointer); if (err == NO_ERROR) n++; }
-    if (gOrigSetFilePointerEx) { err = DetourAttach((PVOID*)&gOrigSetFilePointerEx, WwHookSetFilePointerEx); if (err == NO_ERROR) n++; }
-    if (gOrigGetFileSize) { err = DetourAttach((PVOID*)&gOrigGetFileSize, WwHookGetFileSize); if (err == NO_ERROR) n++; }
-    if (gOrigGetFileSizeEx) { err = DetourAttach((PVOID*)&gOrigGetFileSizeEx, WwHookGetFileSizeEx); if (err == NO_ERROR) n++; }
-    if (gOrigSetEndOfFile) { err = DetourAttach((PVOID*)&gOrigSetEndOfFile, WwHookSetEndOfFile); if (err == NO_ERROR) n++; }
+    WW_ATTACH(&gOrigNtCreateFile, WwHookNtCreateFile, "NtCreateFile", gAttachStatus, 0);
+    WW_ATTACH(&gOrigNtOpenFile, WwHookNtOpenFile, "NtOpenFile", gAttachStatus, 1);
+    WW_ATTACH(&gOrigNtReadFile, WwHookNtReadFile, "NtReadFile", gAttachStatus, 2);
+    WW_ATTACH(&gOrigNtWriteFile, WwHookNtWriteFile, "NtWriteFile", gAttachStatus, 3);
+    WW_ATTACH(&gOrigNtClose, WwHookNtClose, "NtClose", gAttachStatus, 4);
+    WW_ATTACH(&gOrigNtSetInformationFile, WwHookNtSetInformationFile, "NtSetInformationFile", gAttachStatus, 5);
+    WW_ATTACH(&gOrigNtQueryInformationFile, WwHookNtQueryInformationFile, "NtQueryInformationFile", gAttachStatus, 6);
     err = DetourTransactionCommit();
     if (err != NO_ERROR) {
         DetourTransactionAbort();
         return 0;
     }
+    {
+        int i;
+        for (i = 0; i < 7; i++) if (gAttachStatus[i] == '1') n++;
+    }
+    /* Keep the status string visible to DllMain's attach log. */
+    {
+        extern char gWwAttachStatus[8];
+        memcpy(gWwAttachStatus, gAttachStatus, 8);
+    }
     return n;
 }
+char gWwAttachStatus[8] = "???????";
 
 /* ---- DllMain ---- */
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
@@ -683,9 +1036,14 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         {
             WCHAR exeName[MAX_PATH];
             int attached;
+            extern char gWwAttachStatus[8];
             GetOwnExeName(exeName, MAX_PATH);
             attached = WwDetoursInstall();
-            WwEngLog(1, "attach: exe=%ls detours_attached=%d", exeName, attached);
+            /* Per-hook status (1=ok, 0=fail), order: NtCreateFile,
+             * NtOpenFile, NtReadFile, NtWriteFile, NtClose,
+             * NtSetInformationFile, NtQueryInformationFile. A total
+             * alone hides which Attach failed. */
+            WwEngLog(1, "attach: exe=%ls detours_attached=%d status=%s", exeName, attached, gWwAttachStatus);
         }
         WwEngEnsureInit();
     } else if (fdwReason == DLL_PROCESS_DETACH) {
