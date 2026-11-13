@@ -120,6 +120,33 @@ static void PolicyNameToAscii(const WCHAR *wname, char *out, size_t cap)
     out[i] = '\0';
 }
 
+/* Log path: wweng.log next to the DLL. Set up eagerly in DllMain so
+ * the log exists even if no hooked file call ever happens (the lazy
+ * policy load alone cannot prove the DLL was injected). */
+static void WwEngInitLogPath(void)
+{
+    WCHAR dllPath[MAX_PATH];
+    WCHAR *slash;
+    if (gLogPath[0]) return;
+    {
+        DWORD n = GetModuleFileNameW(gOwnModule, dllPath, MAX_PATH);
+        if (n && n < MAX_PATH) {
+            slash = wcsrchr(dllPath, L'\\');
+            if (slash) {
+                size_t dirlen = (size_t)(slash - dllPath + 1);
+                if (dirlen + 10 < MAX_PATH) {
+                    wcsncpy(gLogPath, dllPath, dirlen);
+                    gLogPath[dirlen] = L'\0';
+                    wcscat(gLogPath, L"wweng.log");
+                }
+            }
+        }
+    }
+    if (!gLogPath[0]) {
+        wcscpy(gLogPath, L"C:\\vis\\wweng.log");
+    }
+}
+
 /* Load the policy from the .xcf next to this DLL (or gXcfPath). Called
  * once, lazily, from the first hooked call. Uses ORIGINAL file APIs. */
 static void WwEngLoadPolicy(void)
@@ -152,21 +179,8 @@ static void WwEngLoadPolicy(void)
             wcscpy(gXcfPath, L"C:\\vis\\wwkrn.xcf");
         }
     }
-    /* Log path: wweng.log next to the DLL. */
-    if (!gLogPath[0]) {
-        DWORD n = GetModuleFileNameW(gOwnModule, dllPath, MAX_PATH);
-        if (n && n < MAX_PATH) {
-            slash = wcsrchr(dllPath, L'\\');
-            if (slash) {
-                size_t dirlen = (size_t)(slash - dllPath + 1);
-                if (dirlen + 10 < MAX_PATH) {
-                    wcsncpy(gLogPath, dllPath, dirlen);
-                    gLogPath[dirlen] = L'\0';
-                    wcscat(gLogPath, L"wweng.log");
-                }
-            }
-        }
-    }
+    /* Log path: wweng.log next to the DLL (set up in DllMain now). */
+    WwEngInitLogPath();
     /* Convert the wide path to UTF-8/ANSI for xcf_load (it takes char*). */
     {
         char xcfAnsi[MAX_PATH * 2];
@@ -653,7 +667,21 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
                 if (!gOrigLoadLibraryExW) gOrigLoadLibraryExW = (void *)GetProcAddress(k32, "LoadLibraryExW");
             }
         }
-        WwIatHookAllModules(gHooks, gHookCount);
+        /* Eager diagnostics: set up the log path FIRST so the log
+         * exists even if no hooked call ever happens, then log how
+         * many IAT entries were patched and load the policy eagerly.
+         * (Before this, the log was created only lazily from the
+         * first hooked call, so a DLL that was injected but whose
+         * hooks never fired left no trace at all.) */
+        WwEngInitLogPath();
+        {
+            WCHAR exeName[MAX_PATH];
+            int patched;
+            GetOwnExeName(exeName, MAX_PATH);
+            patched = WwIatHookAllModules(gHooks, gHookCount);
+            WwEngLog(1, "attach: exe=%ls iat_patched=%d", exeName, patched);
+        }
+        WwEngEnsureInit();
     } else if (fdwReason == DLL_PROCESS_DETACH) {
         /* Best effort: free contexts. Do not unpatch IATs. */
         WW_FILE_CTX *c, *next;
