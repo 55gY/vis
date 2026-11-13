@@ -232,8 +232,17 @@ static void WwEngOnCreate(HANDLE h, LPCWSTR lpFileName, DWORD dwDesiredAccess,
     GetOwnExeName(exe, WWFLT_MAX_EXE_LEN);
     if (!WwEngEvaluatePolicy(exe, lpFileName, &mode, policy_name,
                              WWFLT_MAX_GROUP_LEN)) {
+        /* Diagnostic: only log .txt so the log stays readable. */
+        {
+            size_t n = wcslen(lpFileName);
+            if (n >= 4 && _wcsicmp(lpFileName + n - 4, L".txt") == 0) {
+                WwEngLog(2, "policy: NO MATCH exe=%ls file=%ls", exe, lpFileName);
+            }
+        }
         return;
     }
+    WwEngLog(2, "policy: MATCH exe=%ls file=%ls mode=%lu policy=%ls",
+             exe, lpFileName, mode, policy_name);
     /* Get the file size. */
     if (!gOrigGetFileSizeEx(h, &fileSize)) return;
     if (fileSize.QuadPart == 0) {
@@ -317,6 +326,16 @@ static HANDLE WINAPI WwHookCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess
                          lpSecurityAttributes, dwCreationDisposition,
                          dwFlagsAndAttributes, hTemplateFile);
     if (h == INVALID_HANDLE_VALUE) return h;
+    /* Diagnostic: log every .txt open so we can see whether the hook
+     * fires at all (iat_patched>0 does not prove CreateFileW itself
+     * was patched). */
+    {
+        size_t n = wcslen(lpFileName);
+        if (n >= 4 && _wcsicmp(lpFileName + n - 4, L".txt") == 0) {
+            WwEngLog(2, "hook: CreateFileW %ls access=0x%lx disp=%lu",
+                     lpFileName, dwDesiredAccess, dwCreationDisposition);
+        }
+    }
     EnterCriticalSection(&gCtxLock);
     WwEngOnCreate(h, lpFileName, dwDesiredAccess, dwCreationDisposition);
     LeaveCriticalSection(&gCtxLock);
