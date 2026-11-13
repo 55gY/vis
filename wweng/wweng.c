@@ -808,6 +808,47 @@ static NTSTATUS NTAPI WwHookNtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAc
     return st;
 }
 
+/* ---- Async read completion ----
+ * The vendor's read hook handles async I/O (it does not just pass
+ * it through): an async read that returns undecrypted is exactly
+ * how a caller sees garbled content. For an async read we wrap the
+ * caller's APC: when the real read completes, our wrapper decrypts
+ * the buffer (counter = the logical offset) and then invokes the
+ * original APC. If only an Event was given (no APC), there is
+ * nothing to run on completion, so the read is done synchronously
+ * in the hook, decrypted, and the Event is signaled by us. */
+typedef struct _WW_ASYNC_READ_CTX {
+    WW_SBOX_CTX sbox;
+    PVOID buffer;
+    ULONG length;
+    ULONGLONG logical_off;
+    PVOID orig_apc;
+    PVOID orig_apc_ctx;
+} WW_ASYNC_READ_CTX;
+
+typedef VOID (NTAPI *WW_APC_ROUTINE)(PVOID ApcContext, PWW_IO_STATUS_BLOCK IoStatusBlock, ULONG Reserved);
+
+static VOID NTAPI WwReadApc(PVOID ApcContext, PWW_IO_STATUS_BLOCK IoStatusBlock, ULONG Reserved)
+{
+    WW_ASYNC_READ_CTX *actx = (WW_ASYNC_READ_CTX *)ApcContext;
+    WW_APC_ROUTINE orig;
+    PVOID orig_ctx;
+    (void)Reserved;
+    if (actx) {
+        if (IoStatusBlock && IoStatusBlock->Information > 0) {
+            WwSboxDecrypt(&actx->sbox, (unsigned char *)actx->buffer,
+                          (ULONG)IoStatusBlock->Information, actx->logical_off);
+            WwEngLog(2, "ntread: async hbuf=%p logical=%llu bytes=%llu",
+                     actx->buffer, actx->logical_off,
+                     (unsigned long long)IoStatusBlock->Information);
+        }
+        orig = (WW_APC_ROUTINE)actx->orig_apc;
+        orig_ctx = actx->orig_apc_ctx;
+        free(actx);
+        if (orig) orig(orig_ctx, IoStatusBlock, Reserved);
+    }
+}
+
 static NTSTATUS NTAPI WwHookNtReadFile(HANDLE FileHandle, HANDLE Event,
     PVOID ApcRoutine, PVOID ApcContext, PWW_IO_STATUS_BLOCK IoStatusBlock,
     PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key)
@@ -818,12 +859,8 @@ static NTSTATUS NTAPI WwHookNtReadFile(HANDLE FileHandle, HANDLE Event,
     ULONG read = 0;
     BOOL use_explicit_off = FALSE;
     LARGE_INTEGER saved_off;
+    BOOL is_async = (Event != NULL || ApcRoutine != NULL);
 
-    /* Async I/O passes through, like overlapped I/O in Win32. */
-    if (Event || ApcRoutine) {
-        return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                               Buffer, Length, ByteOffset, Key);
-    }
     EnterCriticalSection(&gCtxLock);
     ctx = WwEngFindCtx(FileHandle);
     if (!ctx || !ctx->is_encrypted) {
@@ -868,6 +905,63 @@ static NTSTATUS NTAPI WwHookNtReadFile(HANDLE FileHandle, HANDLE Event,
             }
         }
     }
+    if (is_async && ApcRoutine) {
+        /* Wrap the caller's APC so the buffer is decrypted when the
+         * real read completes. The kernel still signals Event. */
+        WW_ASYNC_READ_CTX *actx = (WW_ASYNC_READ_CTX *)malloc(sizeof(WW_ASYNC_READ_CTX));
+        if (!actx) {
+            /* Out of memory: fall back to a synchronous read. */
+            if (use_explicit_off) ByteOffset->QuadPart = saved_off.QuadPart;
+            else NtSetPosition(FileHandle, &saved_off);
+            LeaveCriticalSection(&gCtxLock);
+            return gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                   Buffer, Length, ByteOffset, Key);
+        }
+        actx->sbox = ctx->sbox;
+        actx->buffer = Buffer;
+        actx->length = Length;
+        actx->logical_off = (ULONGLONG)logical_off;
+        actx->orig_apc = ApcRoutine;
+        actx->orig_apc_ctx = ApcContext;
+        st = gOrigNtReadFile(FileHandle, Event, (PVOID)WwReadApc, (PVOID)actx,
+                             IoStatusBlock, Buffer, Length, ByteOffset, Key);
+        /* Restore the caller's logical view. */
+        if (use_explicit_off) {
+            ByteOffset->QuadPart = saved_off.QuadPart;
+        } else if (WW_NT_SUCCESS(st) && st != 0x103 /* STATUS_PENDING */) {
+            /* Completed synchronously: restore position now. If it is
+             * pending, the position was already advanced by the
+             * kernel; the APC runs after completion and the caller
+             * observes the logical position via our Query hook. */
+            LARGE_INTEGER cur;
+            cur.QuadPart = saved_off.QuadPart + (LONGLONG)(IoStatusBlock ? (LONGLONG)IoStatusBlock->Information : 0);
+            NtSetPosition(FileHandle, &cur);
+        }
+        LeaveCriticalSection(&gCtxLock);
+        return st;
+    }
+    if (is_async) {
+        /* Event only, no APC: do the read synchronously, decrypt,
+         * signal the Event ourselves. The caller waits on the Event
+         * and then sees decrypted data. */
+        st = gOrigNtReadFile(FileHandle, NULL, NULL, NULL, IoStatusBlock,
+                             Buffer, Length, ByteOffset, Key);
+        if (WW_NT_SUCCESS(st) && IoStatusBlock && IoStatusBlock->Information > 0) {
+            read = (ULONG)IoStatusBlock->Information;
+            WwSboxDecrypt(&ctx->sbox, (unsigned char *)Buffer, read, (ULONGLONG)logical_off);
+            WwEngLog(2, "ntread: h=%p logical=%lld bytes=%lu (event-sync)", FileHandle, logical_off, read);
+        }
+        if (use_explicit_off) {
+            ByteOffset->QuadPart = saved_off.QuadPart;
+        } else if (WW_NT_SUCCESS(st) && IoStatusBlock) {
+            LARGE_INTEGER cur;
+            cur.QuadPart = saved_off.QuadPart + (LONGLONG)read;
+            NtSetPosition(FileHandle, &cur);
+        }
+        if (Event) SetEvent(Event);
+        LeaveCriticalSection(&gCtxLock);
+        return st;
+    }
     st = gOrigNtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                          Buffer, Length, ByteOffset, Key);
     if (WW_NT_SUCCESS(st) && IoStatusBlock && IoStatusBlock->Information > 0) {
@@ -887,6 +981,32 @@ static NTSTATUS NTAPI WwHookNtReadFile(HANDLE FileHandle, HANDLE Event,
     return st;
 }
 
+/* ---- Async write completion ----
+ * Like the read path: an async write must carry an encrypted copy
+ * that stays alive until the kernel is done with it. Wrap the
+ * caller's APC to free the copy and invoke the original APC. With
+ * only an Event, do the write synchronously and signal the Event. */
+typedef struct _WW_ASYNC_WRITE_CTX {
+    unsigned char *tmp;
+    PVOID orig_apc;
+    PVOID orig_apc_ctx;
+} WW_ASYNC_WRITE_CTX;
+
+static VOID NTAPI WwWriteApc(PVOID ApcContext, PWW_IO_STATUS_BLOCK IoStatusBlock, ULONG Reserved)
+{
+    WW_ASYNC_WRITE_CTX *actx = (WW_ASYNC_WRITE_CTX *)ApcContext;
+    WW_APC_ROUTINE orig;
+    PVOID orig_ctx;
+    (void)Reserved;
+    if (actx) {
+        free(actx->tmp);
+        orig = (WW_APC_ROUTINE)actx->orig_apc;
+        orig_ctx = actx->orig_apc_ctx;
+        free(actx);
+        if (orig) orig(orig_ctx, IoStatusBlock, Reserved);
+    }
+}
+
 static NTSTATUS NTAPI WwHookNtWriteFile(HANDLE FileHandle, HANDLE Event,
     PVOID ApcRoutine, PVOID ApcContext, PWW_IO_STATUS_BLOCK IoStatusBlock,
     PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key)
@@ -898,11 +1018,8 @@ static NTSTATUS NTAPI WwHookNtWriteFile(HANDLE FileHandle, HANDLE Event,
     BOOL use_explicit_off = FALSE;
     LARGE_INTEGER saved_off;
     ULONG written = 0;
+    BOOL is_async = (Event != NULL || ApcRoutine != NULL);
 
-    if (Event || ApcRoutine) {
-        return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                                Buffer, Length, ByteOffset, Key);
-    }
     EnterCriticalSection(&gCtxLock);
     ctx = WwEngFindCtx(FileHandle);
     if (!ctx || !ctx->is_encrypted || ctx->mode != WWFLT_ENCRYPT_WRITE) {
@@ -949,7 +1066,54 @@ static NTSTATUS NTAPI WwHookNtWriteFile(HANDLE FileHandle, HANDLE Event,
     }
     memcpy(tmp, Buffer, Length);
     WwSboxEncrypt(&ctx->sbox, tmp, Length, (ULONGLONG)logical_off);
-    WwEngLog(2, "ntwrite: h=%p logical=%lld len=%lu expl=%d", FileHandle, logical_off, Length, use_explicit_off ? 1 : 0);
+    WwEngLog(2, "ntwrite: h=%p logical=%lld len=%lu expl=%d async=%d", FileHandle, logical_off, Length, use_explicit_off ? 1 : 0, is_async ? 1 : 0);
+    if (is_async && ApcRoutine) {
+        WW_ASYNC_WRITE_CTX *actx = (WW_ASYNC_WRITE_CTX *)malloc(sizeof(WW_ASYNC_WRITE_CTX));
+        if (!actx) {
+            free(tmp);
+            if (use_explicit_off) ByteOffset->QuadPart = saved_off.QuadPart;
+            else NtSetPosition(FileHandle, &saved_off);
+            LeaveCriticalSection(&gCtxLock);
+            return gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                    Buffer, Length, ByteOffset, Key);
+        }
+        actx->tmp = tmp;
+        actx->orig_apc = ApcRoutine;
+        actx->orig_apc_ctx = ApcContext;
+        st = gOrigNtWriteFile(FileHandle, Event, (PVOID)WwWriteApc, (PVOID)actx,
+                              IoStatusBlock, tmp, Length, ByteOffset, Key);
+        if (use_explicit_off) {
+            ByteOffset->QuadPart = saved_off.QuadPart;
+        } else if (WW_NT_SUCCESS(st) && st != 0x103 /* STATUS_PENDING */ && IoStatusBlock) {
+            LARGE_INTEGER cur;
+            written = (ULONG)IoStatusBlock->Information;
+            cur.QuadPart = saved_off.QuadPart + (LONGLONG)written;
+            NtSetPosition(FileHandle, &cur);
+        }
+        LeaveCriticalSection(&gCtxLock);
+        return st;
+    }
+    if (is_async) {
+        /* Event only: synchronous write, then signal the Event. */
+        st = gOrigNtWriteFile(FileHandle, NULL, NULL, NULL, IoStatusBlock,
+                              tmp, Length, ByteOffset, Key);
+        free(tmp);
+        if (WW_NT_SUCCESS(st) && IoStatusBlock) {
+            WwEngLog(2, "ntwrite: h=%p done written=%llu (event-sync)", FileHandle,
+                     (unsigned long long)IoStatusBlock->Information);
+        }
+        if (use_explicit_off) {
+            ByteOffset->QuadPart = saved_off.QuadPart;
+        } else if (WW_NT_SUCCESS(st) && IoStatusBlock) {
+            LARGE_INTEGER cur;
+            written = (ULONG)IoStatusBlock->Information;
+            cur.QuadPart = saved_off.QuadPart + (LONGLONG)written;
+            NtSetPosition(FileHandle, &cur);
+        }
+        if (Event) SetEvent(Event);
+        LeaveCriticalSection(&gCtxLock);
+        return st;
+    }
     st = gOrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                           tmp, Length, ByteOffset, Key);
     free(tmp);
