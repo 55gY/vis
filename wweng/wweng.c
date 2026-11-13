@@ -468,6 +468,13 @@ static void WwEngOnCreate(HANDLE h, LPCWSTR lpFileName, DWORD dwDesiredAccess,
                 WwEngLog(1, "create: header write failed for %ls", lpFileName);
                 return;
             }
+            /* Diagnostic: physical size right after the header
+             * write, to pin down the 2.txt-lands-at-8-bytes issue. */
+            {
+                LONGLONG after = -1;
+                NtGetFileSizeRaw(h, &after);
+                WwEngLog(2, "create: header written %ls phys_after=%lld", lpFileName, after);
+            }
             ctx = (WW_FILE_CTX *)calloc(1, sizeof(WW_FILE_CTX));
             if (!ctx) return;
             ctx->hFile = h;
@@ -1291,15 +1298,35 @@ static NTSTATUS NTAPI WwHookNtCreateSection(PHANDLE SectionHandle, ACCESS_MASK D
                                         MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
         }
         WwSboxDecrypt(&ctx->sbox, buf, (size_t)logical_size, 0);
+        /* Diagnostic: first bytes of the decrypted content, so a
+         * wrong key/sbox shows up immediately in the log. */
+        {
+            char hex[65];
+            size_t k, n = (size_t)logical_size < 16 ? (size_t)logical_size : 16;
+            for (k = 0; k < n; k++) {
+                hex[k * 2] = "0123456789abcdef"[buf[k] >> 4];
+                hex[k * 2 + 1] = "0123456789abcdef"[buf[k] & 0xf];
+            }
+            hex[n * 2] = '\0';
+            WwEngLog(2, "ntsection: h=%p logical=%lld plain_hex=%s", FileHandle, logical_size, hex);
+        }
+    } else {
+        WwEngLog(2, "ntsection: h=%p logical=%lld (mapped read)", FileHandle, logical_size);
     }
-    WwEngLog(2, "ntsection: h=%p logical=%lld (mapped read)", FileHandle, logical_size);
     LeaveCriticalSection(&gCtxLock);
     /* Anonymous section holding the plaintext. PAGE_READWRITE so we
-     * can copy the data in; the caller may map it read-only. */
+     * can copy the data in; the caller may map it read-only.
+     * NOTE: create it with SECTION_ALL_ACCESS (0xf001f, like the
+     * vendor does), NOT the caller's DesiredAccess. A read-only
+     * caller asks for SECTION_MAP_READ only, and mapping such a
+     * section PAGE_READWRITE to populate it fails -- which silently
+     * fell back to the real (encrypted) section and left 1.txt
+     * garbled. */
     maxsz.QuadPart = logical_size > 0 ? logical_size : 1;
-    st = gOrigNtCreateSection(&anon, DesiredAccess, ObjectAttributes, &maxsz,
+    st = gOrigNtCreateSection(&anon, 0xf001f /* SECTION_ALL_ACCESS */, ObjectAttributes, &maxsz,
                               0x04 /* PAGE_READWRITE */, 0x08000000 /* SEC_COMMIT */, NULL);
     if (!WW_NT_SUCCESS(st) || !anon) {
+        WwEngLog(1, "ntsection: anon create failed st=0x%lx", (unsigned long)st);
         free(buf);
         return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
                                     MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
@@ -1310,6 +1337,7 @@ static NTSTATUS NTAPI WwHookNtCreateSection(PHANDLE SectionHandle, ACCESS_MASK D
         st = gOrigNtMapViewOfSection(anon, (HANDLE)(LONG_PTR)-1 /* NtCurrentProcess */,
                                      &base, 0, 0, &secoff, &viewsz, 1 /* ViewShare */, 0, 0x04 /* PAGE_READWRITE */);
         if (!WW_NT_SUCCESS(st) || !base) {
+            WwEngLog(1, "ntsection: anon map failed st=0x%lx", (unsigned long)st);
             gOrigNtClose(anon);
             free(buf);
             return gOrigNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes,
@@ -1320,6 +1348,7 @@ static NTSTATUS NTAPI WwHookNtCreateSection(PHANDLE SectionHandle, ACCESS_MASK D
     }
     free(buf);
     *SectionHandle = anon;
+    WwEngLog(2, "ntsection: h=%p anon section ok", FileHandle);
     return 0; /* STATUS_SUCCESS */
 }
 
